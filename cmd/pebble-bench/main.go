@@ -114,18 +114,14 @@ func runFlat(ctx context.Context, baseDir, mode string, numKeys, numBatches, bat
 	}
 	defer os.RemoveAll(dir)
 
-	s, err := store.NewFlatStore(dir)
-	if err != nil {
-		return benchmarkResult{engine: "flat", err: fmt.Errorf("failed to create flat store: %w", err)}
-	}
-	defer s.Close()
-
 	gen, err := harness.NewGenerator(mode, numKeys)
 	if err != nil {
 		return benchmarkResult{engine: "flat", err: fmt.Errorf("failed to create generator: %w", err)}
 	}
 
-	res, err := harness.RunBenchmark(ctx, s, dir, gen, numBatches, batchSize)
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, func(d string) (store.IndexStore, error) {
+		return store.NewFlatStore(d)
+	})
 	return benchmarkResult{engine: "flat", results: res, err: err}
 }
 
@@ -136,18 +132,14 @@ func runLog(ctx context.Context, baseDir, mode string, numKeys, numBatches, batc
 	}
 	defer os.RemoveAll(dir)
 
-	s, err := store.NewLogStore(dir)
-	if err != nil {
-		return benchmarkResult{engine: "log", err: fmt.Errorf("failed to create log store: %w", err)}
-	}
-	defer s.Close()
-
 	gen, err := harness.NewGenerator(mode, numKeys)
 	if err != nil {
 		return benchmarkResult{engine: "log", err: fmt.Errorf("failed to create generator: %w", err)}
 	}
 
-	res, err := harness.RunBenchmark(ctx, s, dir, gen, numBatches, batchSize)
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, func(d string) (store.IndexStore, error) {
+		return store.NewLogStore(d)
+	})
 	return benchmarkResult{engine: "log", results: res, err: err}
 }
 
@@ -159,18 +151,14 @@ func runChunk(ctx context.Context, baseDir string, chunkSize uint64, mode string
 	}
 	defer os.RemoveAll(dir)
 
-	s, err := store.NewChunkStore(dir, chunkSize)
-	if err != nil {
-		return benchmarkResult{engine: name, err: fmt.Errorf("failed to create chunk store: %w", err)}
-	}
-	defer s.Close()
-
 	gen, err := harness.NewGenerator(mode, numKeys)
 	if err != nil {
 		return benchmarkResult{engine: name, err: fmt.Errorf("failed to create generator: %w", err)}
 	}
 
-	res, err := harness.RunBenchmark(ctx, s, dir, gen, numBatches, batchSize)
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, func(d string) (store.IndexStore, error) {
+		return store.NewChunkStore(d, chunkSize)
+	})
 	return benchmarkResult{engine: name, results: res, err: err}
 }
 

@@ -15,12 +15,6 @@ func TestRunBenchmark(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	s, err := store.NewFlatStore(tmpDir)
-	if err != nil {
-		t.Fatalf("failed to create FlatStore: %v", err)
-	}
-	defer s.Close()
-
 	gen, err := NewGenerator("A", 100)
 	if err != nil {
 		t.Fatalf("failed to create generator: %v", err)
@@ -29,7 +23,9 @@ func TestRunBenchmark(t *testing.T) {
 	numBatches := 5
 	batchSize := 10
 
-	results, err := RunBenchmark(context.Background(), s, tmpDir, gen, numBatches, batchSize)
+	results, err := RunBenchmark(context.Background(), tmpDir, gen, numBatches, batchSize, func(d string) (store.IndexStore, error) {
+		return store.NewFlatStore(d)
+	})
 	if err != nil {
 		t.Fatalf("RunBenchmark failed: %v", err)
 	}
