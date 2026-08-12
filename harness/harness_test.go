@@ -23,7 +23,7 @@ func TestRunBenchmark(t *testing.T) {
 	numBatches := 5
 	batchSize := 10
 
-	results, err := RunBenchmark(context.Background(), tmpDir, gen, numBatches, batchSize, func(d string) (store.IndexStore, error) {
+	results, err := RunBenchmark(context.Background(), tmpDir, gen, numBatches, batchSize, 100, ReadConfig{}, func(d string) (store.IndexStore, error) {
 		return store.NewFlatStore(d)
 	})
 	if err != nil {
@@ -50,4 +50,55 @@ func TestRunBenchmark(t *testing.T) {
 	}
 
 	t.Logf("Results: %+v", results)
+}
+
+func TestRunBenchmarkWithReaders(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-benchmark-test-readers")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	numKeys := 10000
+	gen, err := NewGenerator("A", numKeys)
+	if err != nil {
+		t.Fatalf("failed to create generator: %v", err)
+	}
+
+	numBatches := 100
+	batchSize := 100
+	readCfg := ReadConfig{
+		NumReaders: 3,
+		ReadRate:   1000,
+		ReadDist:   "uniform",
+		StartPct:   20,
+	}
+
+	results, err := RunBenchmark(context.Background(), tmpDir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
+		return store.NewFlatStore(d)
+	})
+	if err != nil {
+		t.Fatalf("RunBenchmark failed: %v", err)
+	}
+
+	if results.Throughput <= 0 {
+		t.Errorf("expected throughput > 0, got %f", results.Throughput)
+	}
+	if results.ReadThroughput <= 0 {
+		t.Errorf("expected read throughput > 0, got %f", results.ReadThroughput)
+	}
+	if results.ReadP50 <= 0 {
+		t.Errorf("expected ReadP50 > 0, got %v", results.ReadP50)
+	}
+	if results.ReadP99 <= 0 {
+		t.Errorf("expected ReadP99 > 0, got %v", results.ReadP99)
+	}
+	if results.ReadMax <= 0 {
+		t.Errorf("expected ReadMax > 0, got %v", results.ReadMax)
+	}
+	if results.ReadErrors > 0 {
+		t.Errorf("expected 0 read errors, got %d", results.ReadErrors)
+	}
+
+	t.Logf("Results with readers: %+v", results)
 }

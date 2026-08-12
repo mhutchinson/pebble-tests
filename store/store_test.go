@@ -494,3 +494,187 @@ func TestNewChunkStoreInvalidChunkSize(t *testing.T) {
 		s2.Close()
 	}
 }
+
+func TestChunkScanStoreCorrectness_Size2(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-chunk-scan-test-2-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewChunkScanStore(tmpDir, 2)
+	if err != nil {
+		t.Fatalf("Failed to create ChunkScanStore: %v", err)
+	}
+	defer s.Close()
+
+	runIndexStoreTests(t, s)
+}
+
+func TestChunkScanStoreCorrectness_Size1024(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-chunk-scan-test-1024-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewChunkScanStore(tmpDir, 1024)
+	if err != nil {
+		t.Fatalf("Failed to create ChunkScanStore: %v", err)
+	}
+	defer s.Close()
+
+	runIndexStoreTests(t, s)
+}
+
+func TestChunkScanStoreRawInspection(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-chunk-scan-inspect-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewChunkScanStore(tmpDir, 2)
+	if err != nil {
+		t.Fatalf("Failed to create ChunkScanStore: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	key := sha256.Sum256([]byte("inspect-key"))
+
+	// Write first batch: index 10, 11 (both block 5)
+	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {10, 11}}); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	// Verify block 5 is latest
+	prefix := make([]byte, 33)
+	prefix[0] = chunkPrefix
+	copy(prefix[1:], key[:])
+
+	keyBlock5 := make([]byte, 41)
+	copy(keyBlock5, prefix)
+	binary.BigEndian.PutUint64(keyBlock5[33:], 5)
+
+	getRaw := func(k []byte) []byte {
+		val, closer, err := s.db.Get(k)
+		if err != nil {
+			t.Fatalf("Failed to get raw key %x: %v", k, err)
+		}
+		defer closer.Close()
+		ret := make([]byte, len(val))
+		copy(ret, val)
+		return ret
+	}
+
+	val5 := getRaw(keyBlock5)
+	if len(val5) < 9 {
+		t.Fatalf("Value too short: %d", len(val5))
+	}
+	if val5[0] != flagLatest {
+		t.Errorf("Expected block 5 to be latest (0x01), got %x", val5[0])
+	}
+	cum5 := binary.BigEndian.Uint64(val5[1:9])
+	if cum5 != 2 {
+		t.Errorf("Expected block 5 cumulative count to be 2, got %d", cum5)
+	}
+
+	// Range and rel indices check
+	_, range5, rel5, err := deserializeLatestValueScan(val5)
+	if err != nil {
+		t.Fatalf("Failed to deserialize latest value for block 5: %v", err)
+	}
+	if range5.End() != 2 {
+		t.Errorf("Expected range end to be 2, got %d", range5.End())
+	}
+	if !equalUint16Slices(rel5, []uint16{0, 1}) {
+		t.Errorf("Expected rel indices [0, 1], got %v", rel5)
+	}
+
+	// Write second batch: index 20 (block 10)
+	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {20}}); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	// Verify block 5 is now older (0x02)
+	val5Older := getRaw(keyBlock5)
+	if len(val5Older) == 0 {
+		t.Fatalf("Value is empty")
+	}
+	if val5Older[0] != flagOlder {
+		t.Errorf("Expected block 5 to be older (0x02), got %x", val5Older[0])
+	}
+	// Older value schema: 0x02 (1B) + []uint16 (relative indices)
+	// For chunkSize=2, rel indices [0, 1] takes 4 bytes. Total length = 5.
+	if len(val5Older) != 5 {
+		t.Errorf("Expected older block 5 value length to be 5, got %d", len(val5Older))
+	}
+
+	rel5Older, err := deserializeOlderValueScan(val5Older)
+	if err != nil {
+		t.Fatalf("Failed to deserialize older value: %v", err)
+	}
+	if !equalUint16Slices(rel5Older, []uint16{0, 1}) {
+		t.Errorf("Expected rel indices [0, 1], got %v", rel5Older)
+	}
+
+	// Verify block 10 is latest (0x01)
+	keyBlock10 := make([]byte, 41)
+	copy(keyBlock10, prefix)
+	binary.BigEndian.PutUint64(keyBlock10[33:], 10)
+
+	val10 := getRaw(keyBlock10)
+	if len(val10) < 9 {
+		t.Fatalf("Value too short: %d", len(val10))
+	}
+	if val10[0] != flagLatest {
+		t.Errorf("Expected block 10 to be latest (0x01), got %x", val10[0])
+	}
+	cum10 := binary.BigEndian.Uint64(val10[1:9])
+	if cum10 != 3 {
+		t.Errorf("Expected block 10 cumulative count to be 3, got %d", cum10)
+	}
+
+	_, range10, rel10, err := deserializeLatestValueScan(val10)
+	if err != nil {
+		t.Fatalf("Failed to deserialize latest value for block 10: %v", err)
+	}
+	if range10.End() != 3 {
+		t.Errorf("Expected range end to be 3, got %d", range10.End())
+	}
+	if !equalUint16Slices(rel10, []uint16{0}) {
+		t.Errorf("Expected rel indices [0], got %v", rel10)
+	}
+}
+
+func TestNewChunkScanStoreInvalidChunkSize(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-chunk-scan-invalid-size-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if _, err := NewChunkScanStore(tmpDir, 0); err == nil {
+		t.Error("Expected error for chunkSize = 0")
+	}
+
+	if _, err := NewChunkScanStore(tmpDir, 65537); err == nil {
+		t.Error("Expected error for chunkSize = 65537")
+	}
+
+	// Boundary check
+	s1, err := NewChunkScanStore(tmpDir, 1)
+	if err != nil {
+		t.Errorf("Unexpected error for chunkSize = 1: %v", err)
+	} else {
+		s1.Close()
+	}
+
+	s2, err := NewChunkScanStore(tmpDir, 65536)
+	if err != nil {
+		t.Errorf("Unexpected error for chunkSize = 65536: %v", err)
+	} else {
+		s2.Close()
+	}
+}

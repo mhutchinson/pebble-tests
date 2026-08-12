@@ -1,1 +1,3 @@
 pebble-bench
+*.log
+tmp_db/

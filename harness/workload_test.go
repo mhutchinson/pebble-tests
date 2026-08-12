@@ -108,3 +108,161 @@ func TestGenerator_Determinism(t *testing.T) {
 		})
 	}
 }
+
+func TestNewReadGenerator(t *testing.T) {
+	zero := uint64(0)
+	tests := []struct {
+		name    string
+		mode    string
+		numKeys int
+		maxIdx  *uint64
+		wantErr bool
+	}{
+		{"valid A", "A", 100, &zero, false},
+		{"valid B", "B", 100, &zero, false},
+		{"valid C", "C", 100, &zero, false},
+		{"invalid mode", "D", 100, &zero, true},
+		{"invalid numKeys", "A", 0, &zero, true},
+		{"nil maxIdx", "A", 100, nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewReadGenerator(tt.mode, tt.numKeys, tt.maxIdx)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("NewReadGenerator() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestReadGenerator_ModeA(t *testing.T) {
+	maxIdx := uint64(100)
+	g, err := NewReadGenerator("A", 100, &maxIdx)
+	if err != nil {
+		t.Fatalf("failed to create generator: %v", err)
+	}
+
+	// Mode A should generate keys in [0, 9]
+	validHashes := make(map[[32]byte]bool)
+	for i := uint64(0); i < 10; i++ {
+		keyBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(keyBytes, i)
+		validHashes[sha256.Sum256(keyBytes)] = true
+	}
+
+	for i := 0; i < 1000; i++ {
+		hash, _ := g.NextQuery()
+		if !validHashes[hash] {
+			t.Errorf("generated hash not in range [0, 9]")
+		}
+	}
+}
+
+func TestReadGenerator_ModeB(t *testing.T) {
+	numKeys := 5
+	maxIdx := uint64(0)
+	g, err := NewReadGenerator("B", numKeys, &maxIdx)
+	if err != nil {
+		t.Fatalf("failed to create generator: %v", err)
+	}
+
+	// If maxIdx is 0, it should return key ID 0
+	keyBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(keyBytes, 0)
+	expectedHash0 := sha256.Sum256(keyBytes)
+
+	hash, _ := g.NextQuery()
+	if hash != expectedHash0 {
+		t.Errorf("expected key ID 0 when maxIdx is 0")
+	}
+
+	// Now set maxIdx to 10
+	maxIdx = 10
+	validHashes := make(map[[32]byte]bool)
+	for i := uint64(0); i < 5; i++ {
+		keyBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(keyBytes, i)
+		validHashes[sha256.Sum256(keyBytes)] = true
+	}
+
+	for i := 0; i < 1000; i++ {
+		hash, _ := g.NextQuery()
+		if !validHashes[hash] {
+			t.Errorf("generated hash not in range [0, 4] when maxIdx is 10")
+		}
+	}
+}
+
+func TestReadGenerator_ModeC(t *testing.T) {
+	numKeys := 10
+	maxIdx := uint64(100)
+	g, err := NewReadGenerator("C", numKeys, &maxIdx)
+	if err != nil {
+		t.Fatalf("failed to create generator: %v", err)
+	}
+
+	validHashes := make(map[[32]byte]bool)
+	for i := uint64(0); i < 10; i++ {
+		keyBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(keyBytes, i)
+		validHashes[sha256.Sum256(keyBytes)] = true
+	}
+
+	for i := 0; i < 1000; i++ {
+		hash, _ := g.NextQuery()
+		if !validHashes[hash] {
+			t.Errorf("generated hash not in range [0, 9] for Mode C")
+		}
+	}
+}
+
+func TestReadGenerator_StartOffset(t *testing.T) {
+	maxIdx := uint64(100)
+	g, err := NewReadGenerator("A", 100, &maxIdx)
+	if err != nil {
+		t.Fatalf("failed to create generator: %v", err)
+	}
+
+	zeroCount := 0
+	nonZeroCount := 0
+	total := 10000
+
+	for i := 0; i < total; i++ {
+		_, start := g.NextQuery()
+		if start == 0 {
+			zeroCount++
+		} else {
+			nonZeroCount++
+			if start > 5 {
+				t.Errorf("start offset %d exceeds max 5", start)
+			}
+		}
+	}
+
+	expectedNonZero := float64(total) * 0.2 * (5.0 / 6.0)
+	tolerance := float64(total) * 0.05
+
+	if float64(nonZeroCount) < expectedNonZero-tolerance || float64(nonZeroCount) > expectedNonZero+tolerance {
+		t.Errorf("unexpected non-zero start offset count: got %d, want around %f", nonZeroCount, expectedNonZero)
+	}
+}
+
+func TestReadGenerator_Determinism(t *testing.T) {
+	modes := []string{"A", "B", "C"}
+	maxIdx := uint64(100)
+	for _, mode := range modes {
+		t.Run(mode, func(t *testing.T) {
+			g1, _ := NewReadGenerator(mode, 100, &maxIdx)
+			g2, _ := NewReadGenerator(mode, 100, &maxIdx)
+
+			for i := 0; i < 100; i++ {
+				h1, s1 := g1.NextQuery()
+				h2, s2 := g2.NextQuery()
+				if h1 != h2 || s1 != s2 {
+					t.Errorf("generators diverged at step %d", i)
+				}
+			}
+		})
+	}
+}

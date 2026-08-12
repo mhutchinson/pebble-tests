@@ -18,17 +18,29 @@ type benchmarkResult struct {
 	engine     string
 	results    *harness.Results
 	err        error
+	numReaders int
 }
 
 func main() {
 	mode := flag.String("mode", "C", "Workload mode (A, B, C)")
 	entries := flag.Int("entries", 100000, "Total number of log entries to simulate")
 	batchSize := flag.Int("batch_size", 1000, "Number of entries per write batch")
-	enginesStr := flag.String("engines", "flat,log,chunk", "Comma-separated list of engines to run (flat, log, chunk)")
+	enginesStr := flag.String("engines", "flat,log,chunk,chunk_scan", "Comma-separated list of engines to run (flat, log, chunk, chunk_scan)")
 	dbDir := flag.String("db_dir", "./tmp_db", "Root directory for temporary databases")
 	chunkSizesStr := flag.String("chunk_sizes", "256,1024,65536", "Comma-separated list of chunk sizes to test for the chunk engine")
+	readers := flag.Int("readers", 0, "Number of concurrent readers")
+	readRate := flag.Int("read_rate", 0, "Target read QPS (0 for unlimited)")
+	readDist := flag.String("read_dist", "zipfian", "Read distribution (uniform, zipfian, recent)")
+	readStartPct := flag.Float64("read_start_percent", 20, "Percentage of writes completed before starting reads (0-100)")
 
 	flag.Parse()
+
+	readCfg := harness.ReadConfig{
+		NumReaders: *readers,
+		ReadRate:   *readRate,
+		ReadDist:   *readDist,
+		StartPct:   *readStartPct,
+	}
 
 	// Map workload modes to key cardinalities
 	var numKeys int
@@ -89,14 +101,19 @@ func main() {
 		eng = strings.TrimSpace(eng)
 		switch eng {
 		case "flat":
-			res := runFlat(ctx, *dbDir, *mode, numKeys, numBatches, *batchSize)
+			res := runFlat(ctx, *dbDir, *mode, numKeys, numBatches, *batchSize, readCfg)
 			results = append(results, res)
 		case "log":
-			res := runLog(ctx, *dbDir, *mode, numKeys, numBatches, *batchSize)
+			res := runLog(ctx, *dbDir, *mode, numKeys, numBatches, *batchSize, readCfg)
 			results = append(results, res)
 		case "chunk":
 			for _, sz := range chunkSizes {
-				res := runChunk(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize)
+				res := runChunk(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
+				results = append(results, res)
+			}
+		case "chunk_scan":
+			for _, sz := range chunkSizes {
+				res := runChunkScan(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
 				results = append(results, res)
 			}
 		default:
@@ -107,7 +124,7 @@ func main() {
 	printResults(results)
 }
 
-func runFlat(ctx context.Context, baseDir, mode string, numKeys, numBatches, batchSize int) benchmarkResult {
+func runFlat(ctx context.Context, baseDir, mode string, numKeys, numBatches, batchSize int, readCfg harness.ReadConfig) benchmarkResult {
 	dir := filepath.Join(baseDir, "flat")
 	if err := os.RemoveAll(dir); err != nil {
 		return benchmarkResult{engine: "flat", err: fmt.Errorf("failed to clean dir %s: %w", dir, err)}
@@ -119,13 +136,13 @@ func runFlat(ctx context.Context, baseDir, mode string, numKeys, numBatches, bat
 		return benchmarkResult{engine: "flat", err: fmt.Errorf("failed to create generator: %w", err)}
 	}
 
-	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, func(d string) (store.IndexStore, error) {
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
 		return store.NewFlatStore(d)
 	})
-	return benchmarkResult{engine: "flat", results: res, err: err}
+	return benchmarkResult{engine: "flat", results: res, err: err, numReaders: readCfg.NumReaders}
 }
 
-func runLog(ctx context.Context, baseDir, mode string, numKeys, numBatches, batchSize int) benchmarkResult {
+func runLog(ctx context.Context, baseDir, mode string, numKeys, numBatches, batchSize int, readCfg harness.ReadConfig) benchmarkResult {
 	dir := filepath.Join(baseDir, "log")
 	if err := os.RemoveAll(dir); err != nil {
 		return benchmarkResult{engine: "log", err: fmt.Errorf("failed to clean dir %s: %w", dir, err)}
@@ -137,13 +154,13 @@ func runLog(ctx context.Context, baseDir, mode string, numKeys, numBatches, batc
 		return benchmarkResult{engine: "log", err: fmt.Errorf("failed to create generator: %w", err)}
 	}
 
-	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, func(d string) (store.IndexStore, error) {
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
 		return store.NewLogStore(d)
 	})
-	return benchmarkResult{engine: "log", results: res, err: err}
+	return benchmarkResult{engine: "log", results: res, err: err, numReaders: readCfg.NumReaders}
 }
 
-func runChunk(ctx context.Context, baseDir string, chunkSize uint64, mode string, numKeys, numBatches, batchSize int) benchmarkResult {
+func runChunk(ctx context.Context, baseDir string, chunkSize uint64, mode string, numKeys, numBatches, batchSize int, readCfg harness.ReadConfig) benchmarkResult {
 	name := fmt.Sprintf("chunk (size=%d)", chunkSize)
 	dir := filepath.Join(baseDir, fmt.Sprintf("chunk_%d", chunkSize))
 	if err := os.RemoveAll(dir); err != nil {
@@ -156,26 +173,65 @@ func runChunk(ctx context.Context, baseDir string, chunkSize uint64, mode string
 		return benchmarkResult{engine: name, err: fmt.Errorf("failed to create generator: %w", err)}
 	}
 
-	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, func(d string) (store.IndexStore, error) {
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
 		return store.NewChunkStore(d, chunkSize)
 	})
-	return benchmarkResult{engine: name, results: res, err: err}
+	return benchmarkResult{engine: name, results: res, err: err, numReaders: readCfg.NumReaders}
+}
+
+func runChunkScan(ctx context.Context, baseDir string, chunkSize uint64, mode string, numKeys, numBatches, batchSize int, readCfg harness.ReadConfig) benchmarkResult {
+	name := fmt.Sprintf("chunk_scan (size=%d)", chunkSize)
+	dir := filepath.Join(baseDir, fmt.Sprintf("chunk_scan_%d", chunkSize))
+	if err := os.RemoveAll(dir); err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to clean dir %s: %w", dir, err)}
+	}
+	defer os.RemoveAll(dir)
+
+	gen, err := harness.NewGenerator(mode, numKeys)
+	if err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to create generator: %w", err)}
+	}
+
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
+		return store.NewChunkScanStore(d, chunkSize)
+	})
+	return benchmarkResult{engine: name, results: res, err: err, numReaders: readCfg.NumReaders}
 }
 
 func printResults(results []benchmarkResult) {
-	fmt.Println("\n| Engine | Throughput (ops/sec) | p50 Latency | p99 Latency | Max Latency | Size Before Compaction | Size After Compaction |")
-	fmt.Println("|---|---|---|---|---|---|---|")
+	fmt.Println("\n| Engine | Write QPS | Write p50 | Write p99 | Write Max | Read QPS | Read p50 | Read p99 | Read Max | Read Errors | Size Before | Size After |")
+	fmt.Println("|---|---|---|---|---|---|---|---|---|---|---|---|")
 	for _, r := range results {
 		if r.err != nil {
-			fmt.Printf("| %s | ERROR: %v | | | | | |\n", r.engine, r.err)
+			fmt.Printf("| %s | ERROR: %v | | | | | | | | | | |\n", r.engine, r.err)
 			continue
 		}
-		fmt.Printf("| %s | %.2f | %v | %v | %v | %s | %s |\n",
+
+		readQPS := "N/A"
+		readP50 := "N/A"
+		readP99 := "N/A"
+		readMax := "N/A"
+		readErrors := "N/A"
+
+		if r.numReaders > 0 {
+			readQPS = fmt.Sprintf("%.2f", r.results.ReadThroughput)
+			readP50 = fmt.Sprintf("%v", r.results.ReadP50)
+			readP99 = fmt.Sprintf("%v", r.results.ReadP99)
+			readMax = fmt.Sprintf("%v", r.results.ReadMax)
+			readErrors = fmt.Sprintf("%d", r.results.ReadErrors)
+		}
+
+		fmt.Printf("| %s | %.2f | %v | %v | %v | %s | %s | %s | %s | %s | %s | %s |\n",
 			r.engine,
 			r.results.Throughput,
 			r.results.P50Latency,
 			r.results.P99Latency,
 			r.results.MaxLatency,
+			readQPS,
+			readP50,
+			readP99,
+			readMax,
+			readErrors,
 			formatBytes(r.results.SizeBeforeBytes),
 			formatBytes(r.results.SizeAfterBytes),
 		)
