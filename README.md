@@ -6,7 +6,7 @@ Based on extensive benchmarking, we recommend **`PebbleChunkScan` (Chunked Log w
 
 ### Schema Organization
 
-Data is partitioned into fixed-size chunks (blocks) per key.
+Data is partitioned into chunks (blocks) per key, where the chunk size (e.g., 65536) dictates the number of logical indices (sequence numbers) mapped to each block (i.e., blockNum = index / chunkSize), not the byte size.
 
 *   **Keys**: `[Prefix 'c' (1B)] + [Hash(Key) (32B)] + [BlockNum (8B, BigEndian)]`
     *   Using BigEndian for `BlockNum` ensures that blocks for a given key are stored sequentially on disk, enabling efficient range scans.
@@ -21,9 +21,9 @@ Data is partitioned into fixed-size chunks (blocks) per key.
 *   **Write (Append)**:
     1.  Perform a `SeekLT` using `Prefix + Hash(Key) + 0xFFFFFFFFFFFFFFFF` to find the current latest block.
     2.  Deserialize the latest block.
-    3.  Append new indices. If the chunk size limit is exceeded:
-        *   Seal the current block as `Older` (stripping the compact range metadata and writing only relative indices).
-        *   Create a new `Latest` block with the remaining indices.
+    3.  Append new indices. A block is sealed when a new index crosses the logical block boundary (i.e. `index / chunkSize != currBlockNum`), regardless of how many elements have actually been written to the current block. For sparse index sequences, a block can be sealed containing as few as one element.
+        *   To seal: write the current block as `Older` (stripping the compact range metadata and writing only relative indices).
+        *   Start a new block for the index crossing the boundary, writing it as the `Latest` block.
     4.  Commit the batch.
 *   **Read (Lookup)**:
     1.  Calculate the starting block number: `startBlock = start / chunkSize`.
