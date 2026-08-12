@@ -306,6 +306,22 @@ func equalSlices(a, b []uint64) bool {
 	return true
 }
 
+func TestSealingChunkStoreCorrectness_Size2(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-sealing-chunk-test-2-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewSealingChunkStore(tmpDir, 2)
+	if err != nil {
+		t.Fatalf("Failed to create SealingChunkStore: %v", err)
+	}
+	defer s.Close()
+
+	runIndexStoreTests(t, s)
+}
+
 func TestChunkStoreCorrectness_Size2(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "pebble-chunk-test-2-*")
 	if err != nil {
@@ -316,6 +332,22 @@ func TestChunkStoreCorrectness_Size2(t *testing.T) {
 	s, err := NewChunkStore(tmpDir, 2)
 	if err != nil {
 		t.Fatalf("Failed to create ChunkStore: %v", err)
+	}
+	defer s.Close()
+
+	runIndexStoreTests(t, s)
+}
+
+func TestSealingChunkStoreCorrectness_Size1024(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-sealing-chunk-test-1024-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewSealingChunkStore(tmpDir, 1024)
+	if err != nil {
+		t.Fatalf("Failed to create SealingChunkStore: %v", err)
 	}
 	defer s.Close()
 
@@ -338,14 +370,14 @@ func TestChunkStoreCorrectness_Size1024(t *testing.T) {
 	runIndexStoreTests(t, s)
 }
 
-func TestChunkStoreRawInspection(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "pebble-chunk-inspect-test-*")
+func TestSealingChunkStoreRawInspection(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-sealing-chunk-inspect-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	s, err := NewChunkStore(tmpDir, 2)
+	s, err := NewSealingChunkStore(tmpDir, 2)
 	if err != nil {
 		t.Fatalf("Failed to create ChunkStore: %v", err)
 	}
@@ -380,7 +412,7 @@ func TestChunkStoreRawInspection(t *testing.T) {
 	}
 
 	val5 := getRaw(keyChunk5)
-	p5PrevChunkNum, p5CumulativeCount, range5, _, err := deserializeLatestValue(val5)
+	p5PrevChunkNum, p5CumulativeCount, range5, _, err := deserializeLatestValueSealing(val5)
 	if err != nil {
 		t.Fatalf("Failed to deserialize latest value for chunk 5: %v", err)
 	}
@@ -435,7 +467,7 @@ func TestChunkStoreRawInspection(t *testing.T) {
 	binary.BigEndian.PutUint64(keyChunk10[33:], 10)
 
 	val10 := getRaw(keyChunk10)
-	p10PrevChunkNum, p10CumulativeCount, range10, _, err := deserializeLatestValue(val10)
+	p10PrevChunkNum, p10CumulativeCount, range10, _, err := deserializeLatestValueSealing(val10)
 	if err != nil {
 		t.Fatalf("Failed to deserialize latest value for chunk 10: %v", err)
 	}
@@ -447,6 +479,121 @@ func TestChunkStoreRawInspection(t *testing.T) {
 	}
 	if range10.End() != 2 {
 		t.Errorf("Expected chunk 10 range end to be 2, got %d", range10.End())
+	}
+}
+
+
+
+func TestChunkStoreRawInspection(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-chunk-inspect-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewChunkStore(tmpDir, 2)
+	if err != nil {
+		t.Fatalf("Failed to create ChunkStore: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	key := sha256.Sum256([]byte("inspect-key"))
+
+	// Write first batch: index 10, 11 (both chunk 5)
+	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {10, 11}}); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	prefix := make([]byte, 33)
+	prefix[0] = chunkPrefix
+	copy(prefix[1:], key[:])
+
+	keyChunk5 := make([]byte, 41)
+	copy(keyChunk5, prefix)
+	binary.BigEndian.PutUint64(keyChunk5[33:], 5)
+
+	getRaw := func(k []byte) []byte {
+		val, closer, err := s.db.Get(k)
+		if err != nil {
+			t.Fatalf("Failed to get raw key %x: %v", k, err)
+		}
+		defer closer.Close()
+		ret := make([]byte, len(val))
+		copy(ret, val)
+		return ret
+	}
+
+	val5 := getRaw(keyChunk5)
+	range5, rel5, err := deserializeChunkValue(val5)
+	if err != nil {
+		t.Fatalf("Failed to deserialize chunk 5 value: %v", err)
+	}
+	if range5.End() != 0 {
+		t.Errorf("Expected chunk 5 range end to be 0, got %d", range5.End())
+	}
+	if !equalUint16Slices(rel5, []uint16{0, 1}) {
+		t.Errorf("Expected rel indices [0, 1], got %v", rel5)
+	}
+
+	// Write second batch: index 20 (chunk 10)
+	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {20}}); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	// In No-Seal, chunk 5 is NOT modified/rewritten when crossing boundary.
+	// Verify its value is exactly identical.
+	val5After := getRaw(keyChunk5)
+	if !bytes.Equal(val5, val5After) {
+		t.Errorf("Expected chunk 5 value to remain unchanged, got diff")
+	}
+
+	// Verify chunk 10
+	keyChunk10 := make([]byte, 41)
+	copy(keyChunk10, prefix)
+	binary.BigEndian.PutUint64(keyChunk10[33:], 10)
+
+	val10 := getRaw(keyChunk10)
+	range10, rel10, err := deserializeChunkValue(val10)
+	if err != nil {
+		t.Fatalf("Failed to deserialize chunk 10 value: %v", err)
+	}
+	if range10.End() != 2 {
+		t.Errorf("Expected chunk 10 range end to be 2 (covering chunk 5), got %d", range10.End())
+	}
+	if !equalUint16Slices(rel10, []uint16{0}) {
+		t.Errorf("Expected rel indices [0], got %v", rel10)
+	}
+}
+
+func TestNewSealingChunkStoreInvalidChunkSize(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-sealing-chunk-invalid-size-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if _, err := NewSealingChunkStore(tmpDir, 0); err == nil {
+		t.Error("Expected error for chunkSize = 0")
+	}
+
+	if _, err := NewSealingChunkStore(tmpDir, 65537); err == nil {
+		t.Error("Expected error for chunkSize = 65537")
+	}
+
+	// Boundary check
+	s1, err := NewSealingChunkStore(tmpDir, 1)
+	if err != nil {
+		t.Errorf("Unexpected error for chunkSize = 1: %v", err)
+	} else {
+		s1.Close()
+	}
+
+	s2, err := NewSealingChunkStore(tmpDir, 65536)
+	if err != nil {
+		t.Errorf("Unexpected error for chunkSize = 65536: %v", err)
+	} else {
+		s2.Close()
 	}
 }
 
@@ -492,6 +639,190 @@ func TestNewChunkStoreInvalidChunkSize(t *testing.T) {
 		s2.Close()
 	}
 }
+
+func TestSealingChunkScanStoreCorrectness_Size2(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-sealing-chunk-scan-test-2-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewSealingChunkScanStore(tmpDir, 2)
+	if err != nil {
+		t.Fatalf("Failed to create SealingChunkScanStore: %v", err)
+	}
+	defer s.Close()
+
+	runIndexStoreTests(t, s)
+}
+
+func TestSealingChunkScanStoreCorrectness_Size1024(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-sealing-chunk-scan-test-1024-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewSealingChunkScanStore(tmpDir, 1024)
+	if err != nil {
+		t.Fatalf("Failed to create SealingChunkScanStore: %v", err)
+	}
+	defer s.Close()
+
+	runIndexStoreTests(t, s)
+}
+
+func TestSealingChunkScanStoreRawInspection(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-sealing-chunk-scan-inspect-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewSealingChunkScanStore(tmpDir, 2)
+	if err != nil {
+		t.Fatalf("Failed to create SealingChunkScanStore: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	key := sha256.Sum256([]byte("inspect-key"))
+
+	// Write first batch: index 10, 11 (both chunk 5)
+	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {10, 11}}); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	// Verify chunk 5 is latest
+	prefix := make([]byte, 33)
+	prefix[0] = chunkPrefix
+	copy(prefix[1:], key[:])
+
+	keyChunk5 := make([]byte, 41)
+	copy(keyChunk5, prefix)
+	binary.BigEndian.PutUint64(keyChunk5[33:], 5)
+
+	getRaw := func(k []byte) []byte {
+		val, closer, err := s.db.Get(k)
+		if err != nil {
+			t.Fatalf("Failed to get raw key %x: %v", k, err)
+		}
+		defer closer.Close()
+		ret := make([]byte, len(val))
+		copy(ret, val)
+		return ret
+	}
+
+	val5 := getRaw(keyChunk5)
+	if len(val5) < 9 {
+		t.Fatalf("Value too short: %d", len(val5))
+	}
+	if val5[0] != flagLatest {
+		t.Errorf("Expected chunk 5 to be latest (0x01), got %x", val5[0])
+	}
+	cum5 := binary.BigEndian.Uint64(val5[1:9])
+	if cum5 != 2 {
+		t.Errorf("Expected chunk 5 cumulative count to be 2, got %d", cum5)
+	}
+
+	// Range and rel indices check
+	_, range5, rel5, err := deserializeLatestValueScanSealing(val5)
+	if err != nil {
+		t.Fatalf("Failed to deserialize latest value for chunk 5: %v", err)
+	}
+	if range5.End() != 0 {
+		t.Errorf("Expected range end to be 0, got %d", range5.End())
+	}
+	if !equalUint16Slices(rel5, []uint16{0, 1}) {
+		t.Errorf("Expected rel indices [0, 1], got %v", rel5)
+	}
+
+	// Write second batch: index 20 (chunk 10)
+	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {20}}); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	// Verify chunk 5 is now older (0x02)
+	val5Older := getRaw(keyChunk5)
+	if len(val5Older) == 0 {
+		t.Fatalf("Value is empty")
+	}
+	if val5Older[0] != flagOlder {
+		t.Errorf("Expected chunk 5 to be older (0x02), got %x", val5Older[0])
+	}
+	if len(val5Older) != 5 {
+		t.Errorf("Expected older chunk 5 value length to be 5, got %d", len(val5Older))
+	}
+
+	rel5Older, err := deserializeOlderValueScanSealing(val5Older)
+	if err != nil {
+		t.Fatalf("Failed to deserialize older value: %v", err)
+	}
+	if !equalUint16Slices(rel5Older, []uint16{0, 1}) {
+		t.Errorf("Expected rel indices [0, 1], got %v", rel5Older)
+	}
+
+	// Verify chunk 10 is latest (0x01)
+	keyChunk10 := make([]byte, 41)
+	copy(keyChunk10, prefix)
+	binary.BigEndian.PutUint64(keyChunk10[33:], 10)
+
+	val10 := getRaw(keyChunk10)
+	if len(val10) < 9 {
+		t.Fatalf("Value too short: %d", len(val10))
+	}
+	if val10[0] != flagLatest {
+		t.Errorf("Expected chunk 10 to be latest (0x01), got %x", val10[0])
+	}
+	cum10 := binary.BigEndian.Uint64(val10[1:9])
+	if cum10 != 3 {
+		t.Errorf("Expected chunk 10 cumulative count to be 3, got %d", cum10)
+	}
+
+	_, range10, rel10, err := deserializeLatestValueScanSealing(val10)
+	if err != nil {
+		t.Fatalf("Failed to deserialize latest value for chunk 10: %v", err)
+	}
+	if range10.End() != 2 {
+		t.Errorf("Expected range end to be 2, got %d", range10.End())
+	}
+	if !equalUint16Slices(rel10, []uint16{0}) {
+		t.Errorf("Expected rel indices [0], got %v", rel10)
+	}
+}
+
+func TestNewSealingChunkScanStoreInvalidChunkSize(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-sealing-chunk-scan-invalid-size-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if _, err := NewSealingChunkScanStore(tmpDir, 0); err == nil {
+		t.Error("Expected error for chunkSize = 0")
+	}
+
+	if _, err := NewSealingChunkScanStore(tmpDir, 65537); err == nil {
+		t.Error("Expected error for chunkSize = 65537")
+	}
+
+	// Boundary check
+	s1, err := NewSealingChunkScanStore(tmpDir, 1)
+	if err != nil {
+		t.Errorf("Unexpected error for chunkSize = 1: %v", err)
+	} else {
+		s1.Close()
+	}
+
+	s2, err := NewSealingChunkScanStore(tmpDir, 65536)
+	if err != nil {
+		t.Errorf("Unexpected error for chunkSize = 65536: %v", err)
+	} else {
+		s2.Close()
+	}
+}
+
+// --- No-Seal ChunkScanStore Tests ---
 
 func TestChunkScanStoreCorrectness_Size2(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "pebble-chunk-scan-test-2-*")
@@ -546,7 +877,6 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
 
-	// Verify chunk 5 is latest
 	prefix := make([]byte, 33)
 	prefix[0] = chunkPrefix
 	copy(prefix[1:], key[:])
@@ -567,24 +897,12 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 	}
 
 	val5 := getRaw(keyChunk5)
-	if len(val5) < 9 {
-		t.Fatalf("Value too short: %d", len(val5))
-	}
-	if val5[0] != flagLatest {
-		t.Errorf("Expected chunk 5 to be latest (0x01), got %x", val5[0])
-	}
-	cum5 := binary.BigEndian.Uint64(val5[1:9])
-	if cum5 != 2 {
-		t.Errorf("Expected chunk 5 cumulative count to be 2, got %d", cum5)
-	}
-
-	// Range and rel indices check
-	_, range5, rel5, err := deserializeLatestValueScan(val5)
+	range5, rel5, err := deserializeChunkValue(val5)
 	if err != nil {
-		t.Fatalf("Failed to deserialize latest value for chunk 5: %v", err)
+		t.Fatalf("Failed to deserialize chunk 5 value: %v", err)
 	}
 	if range5.End() != 0 {
-		t.Errorf("Expected range end to be 0, got %d", range5.End())
+		t.Errorf("Expected chunk 5 range end to be 0, got %d", range5.End())
 	}
 	if !equalUint16Slices(rel5, []uint16{0, 1}) {
 		t.Errorf("Expected rel indices [0, 1], got %v", rel5)
@@ -595,51 +913,25 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
 
-	// Verify chunk 5 is now older (0x02)
-	val5Older := getRaw(keyChunk5)
-	if len(val5Older) == 0 {
-		t.Fatalf("Value is empty")
-	}
-	if val5Older[0] != flagOlder {
-		t.Errorf("Expected chunk 5 to be older (0x02), got %x", val5Older[0])
-	}
-	// Older value schema: 0x02 (1B) + []uint16 (relative indices)
-	// For chunkSize=2, rel indices [0, 1] takes 4 bytes. Total length = 5.
-	if len(val5Older) != 5 {
-		t.Errorf("Expected older chunk 5 value length to be 5, got %d", len(val5Older))
+	// In No-Seal, chunk 5 is NOT modified/rewritten when crossing boundary.
+	// Verify its value is exactly identical.
+	val5After := getRaw(keyChunk5)
+	if !bytes.Equal(val5, val5After) {
+		t.Errorf("Expected chunk 5 value to remain unchanged, got diff")
 	}
 
-	rel5Older, err := deserializeOlderValueScan(val5Older)
-	if err != nil {
-		t.Fatalf("Failed to deserialize older value: %v", err)
-	}
-	if !equalUint16Slices(rel5Older, []uint16{0, 1}) {
-		t.Errorf("Expected rel indices [0, 1], got %v", rel5Older)
-	}
-
-	// Verify chunk 10 is latest (0x01)
+	// Verify chunk 10
 	keyChunk10 := make([]byte, 41)
 	copy(keyChunk10, prefix)
 	binary.BigEndian.PutUint64(keyChunk10[33:], 10)
 
 	val10 := getRaw(keyChunk10)
-	if len(val10) < 9 {
-		t.Fatalf("Value too short: %d", len(val10))
-	}
-	if val10[0] != flagLatest {
-		t.Errorf("Expected chunk 10 to be latest (0x01), got %x", val10[0])
-	}
-	cum10 := binary.BigEndian.Uint64(val10[1:9])
-	if cum10 != 3 {
-		t.Errorf("Expected chunk 10 cumulative count to be 3, got %d", cum10)
-	}
-
-	_, range10, rel10, err := deserializeLatestValueScan(val10)
+	range10, rel10, err := deserializeChunkValue(val10)
 	if err != nil {
-		t.Fatalf("Failed to deserialize latest value for chunk 10: %v", err)
+		t.Fatalf("Failed to deserialize chunk 10 value: %v", err)
 	}
 	if range10.End() != 2 {
-		t.Errorf("Expected range end to be 2, got %d", range10.End())
+		t.Errorf("Expected chunk 10 range end to be 2 (covering chunk 5), got %d", range10.End())
 	}
 	if !equalUint16Slices(rel10, []uint16{0}) {
 		t.Errorf("Expected rel indices [0], got %v", rel10)
@@ -687,6 +979,10 @@ func TestCrossEngineConsistency(t *testing.T) {
 	defer os.RemoveAll(dirFlat)
 	dirLog, _ := os.MkdirTemp("", "pebble-consistency-log-*")
 	defer os.RemoveAll(dirLog)
+	dirSealingChunk, _ := os.MkdirTemp("", "pebble-consistency-sealing-chunk-*")
+	defer os.RemoveAll(dirSealingChunk)
+	dirSealingScan, _ := os.MkdirTemp("", "pebble-consistency-sealing-scan-*")
+	defer os.RemoveAll(dirSealingScan)
 	dirChunk, _ := os.MkdirTemp("", "pebble-consistency-chunk-*")
 	defer os.RemoveAll(dirChunk)
 	dirScan, _ := os.MkdirTemp("", "pebble-consistency-scan-*")
@@ -696,13 +992,17 @@ func TestCrossEngineConsistency(t *testing.T) {
 	defer sFlat.Close()
 	sLog, _ := NewLogStore(dirLog)
 	defer sLog.Close()
+	sSealingChunk, _ := NewSealingChunkStore(dirSealingChunk, 4)
+	defer sSealingChunk.Close()
+	sSealingScan, _ := NewSealingChunkScanStore(dirSealingScan, 4)
+	defer sSealingScan.Close()
 	sChunk, _ := NewChunkStore(dirChunk, 4) // chunk size 4
 	defer sChunk.Close()
 	sScan, _ := NewChunkScanStore(dirScan, 4) // chunk size 4
 	defer sScan.Close()
 
-	stores := []IndexStore{sFlat, sLog, sChunk, sScan}
-	names := []string{"FlatStore", "LogStore", "ChunkStore", "ChunkScanStore"}
+	stores := []IndexStore{sFlat, sLog, sSealingChunk, sSealingScan, sChunk, sScan}
+	names := []string{"FlatStore", "LogStore", "SealingChunkStore", "SealingChunkScanStore", "ChunkStore", "ChunkScanStore"}
 
 	// Sequence of writes
 	batches := []map[[32]byte][]uint64{

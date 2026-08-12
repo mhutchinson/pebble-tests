@@ -25,7 +25,7 @@ func main() {
 	mode := flag.String("mode", "C", "Workload mode (A, B, C)")
 	entries := flag.Int("entries", 100000, "Total number of log entries to simulate")
 	batchSize := flag.Int("batch_size", 1000, "Number of entries per write batch")
-	enginesStr := flag.String("engines", "flat,log,chunk,chunk_scan", "Comma-separated list of engines to run (flat, log, chunk, chunk_scan)")
+	enginesStr := flag.String("engines", "flat,log,chunk,chunk_scan,sealing_chunk,sealing_chunk_scan", "Comma-separated list of engines to run (flat, log, chunk, chunk_scan, sealing_chunk, sealing_chunk_scan)")
 	dbDir := flag.String("db_dir", "./tmp_db", "Root directory for temporary databases")
 	chunkSizesStr := flag.String("chunk_sizes", "256,1024,65536", "Comma-separated list of chunk sizes to test for the chunk engine")
 	readers := flag.Int("readers", 0, "Number of concurrent readers")
@@ -116,6 +116,16 @@ func main() {
 				res := runChunkScan(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
 				results = append(results, res)
 			}
+		case "sealing_chunk":
+			for _, sz := range chunkSizes {
+				res := runSealingChunk(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
+				results = append(results, res)
+			}
+		case "sealing_chunk_scan":
+			for _, sz := range chunkSizes {
+				res := runSealingChunkScan(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
+				results = append(results, res)
+			}
 		default:
 			log.Printf("Unknown engine: %s", eng)
 		}
@@ -194,6 +204,44 @@ func runChunkScan(ctx context.Context, baseDir string, chunkSize uint64, mode st
 
 	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
 		return store.NewChunkScanStore(d, chunkSize)
+	})
+	return benchmarkResult{engine: name, results: res, err: err, numReaders: readCfg.NumReaders}
+}
+
+func runSealingChunk(ctx context.Context, baseDir string, chunkSize uint64, mode string, numKeys, numBatches, batchSize int, readCfg harness.ReadConfig) benchmarkResult {
+	name := fmt.Sprintf("sealing_chunk (size=%d)", chunkSize)
+	dir := filepath.Join(baseDir, fmt.Sprintf("sealing_chunk_%d", chunkSize))
+	if err := os.RemoveAll(dir); err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to clean dir %s: %w", dir, err)}
+	}
+	defer os.RemoveAll(dir)
+
+	gen, err := harness.NewGenerator(mode, numKeys)
+	if err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to create generator: %w", err)}
+	}
+
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
+		return store.NewSealingChunkStore(d, chunkSize)
+	})
+	return benchmarkResult{engine: name, results: res, err: err, numReaders: readCfg.NumReaders}
+}
+
+func runSealingChunkScan(ctx context.Context, baseDir string, chunkSize uint64, mode string, numKeys, numBatches, batchSize int, readCfg harness.ReadConfig) benchmarkResult {
+	name := fmt.Sprintf("sealing_chunk_scan (size=%d)", chunkSize)
+	dir := filepath.Join(baseDir, fmt.Sprintf("sealing_chunk_scan_%d", chunkSize))
+	if err := os.RemoveAll(dir); err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to clean dir %s: %w", dir, err)}
+	}
+	defer os.RemoveAll(dir)
+
+	gen, err := harness.NewGenerator(mode, numKeys)
+	if err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to create generator: %w", err)}
+	}
+
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
+		return store.NewSealingChunkScanStore(d, chunkSize)
 	})
 	return benchmarkResult{engine: name, results: res, err: err, numReaders: readCfg.NumReaders}
 }

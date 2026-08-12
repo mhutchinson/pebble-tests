@@ -4,6 +4,8 @@ import (
 	"context"
 )
 
+const chunkPrefix = 'c'
+
 // IndexStore defines the interface for the Pebble storage engines.
 type IndexStore interface {
 	// WriteBatch writes a batch of updates atomically.

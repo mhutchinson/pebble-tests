@@ -12,7 +12,7 @@ import (
 )
 
 // ChunkScanStore implements the IndexStore interface using a chunked log construction
-// in Pebble, optimized for range scans.
+// in Pebble, optimized for range scans using the No-Seal layout.
 type ChunkScanStore struct {
 	db        *pebble.DB
 	chunkSize uint64
@@ -45,6 +45,7 @@ func (s *ChunkScanStore) Close() error {
 
 // WriteBatch writes a batch of updates atomically.
 func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]uint64) error {
+	// Share identical implementation with ChunkStore WriteBatch
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
@@ -90,7 +91,7 @@ func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]
 		var currChunkNum uint64
 		var currRange *compact.Range
 		var currRelativeIndices []uint16
-		var currCumulativeCount uint64
+		var modified bool
 
 		hasPrev := prevKey != nil
 		if hasPrev {
@@ -99,26 +100,37 @@ func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]
 			}
 			prevChunkNum := binary.BigEndian.Uint64(prevKey[33:])
 
-			pCumulativeCount, pRange, pRelIndices, err := deserializeLatestValueScan(prevVal)
+			pRange, pRelIndices, err := deserializeChunkValue(prevVal)
 			if err != nil {
-				return fmt.Errorf("failed to deserialize latest value for key %x, chunk %d: %w", key, prevChunkNum, err)
+				return fmt.Errorf("failed to deserialize latest chunk value for key %x, chunk %d: %w", key, prevChunkNum, err)
 			}
 
 			currChunkNum = prevChunkNum
-			currCumulativeCount = pCumulativeCount
 			currRange = pRange
 			currRelativeIndices = pRelIndices
+			modified = false
 		} else {
 			currChunkNum = newIndices[0] / s.chunkSize
 			currRange = fact.NewEmptyRange(0)
 			currRelativeIndices = []uint16{}
-			currCumulativeCount = 0
+			modified = true
 		}
 
 		for _, idx := range newIndices {
 			chunkNum := idx / s.chunkSize
 			if chunkNum != currChunkNum {
-				// Reconstruct absolute indices and append leaf hashes to currRange
+				// Seal current chunk by writing its final state if it was modified.
+				if modified {
+					olderValBytes := serializeChunkValue(currRange, currRelativeIndices)
+					dbKey := make([]byte, 41)
+					copy(dbKey, prefix)
+					binary.BigEndian.PutUint64(dbKey[33:], currChunkNum)
+					if err := batch.Set(dbKey, olderValBytes, pebble.NoSync); err != nil {
+						return fmt.Errorf("failed to write sealed chunk %d: %w", currChunkNum, err)
+					}
+				}
+
+				// Compute finalized range in memory for the new chunk's starting_range.
 				for _, rel := range currRelativeIndices {
 					abs := currChunkNum*s.chunkSize + uint64(rel)
 					var idxBytes [8]byte
@@ -129,32 +141,26 @@ func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]
 					}
 				}
 
-				// Seal current chunk as Older
-				olderValBytes := serializeOlderValueScan(currRelativeIndices)
-				dbKey := make([]byte, 41)
-				copy(dbKey, prefix)
-				binary.BigEndian.PutUint64(dbKey[33:], currChunkNum)
-				if err := batch.Set(dbKey, olderValBytes, pebble.NoSync); err != nil {
-					return fmt.Errorf("failed to seal chunk %d as older: %w", currChunkNum, err)
-				}
-
 				// Set up new chunk
 				currChunkNum = chunkNum
 				currRelativeIndices = []uint16{}
+				modified = true
 			}
 
 			relIdx := uint16(idx % s.chunkSize)
 			currRelativeIndices = append(currRelativeIndices, relIdx)
-			currCumulativeCount++
+			modified = true
 		}
 
-		// Write final chunk as Latest
-		latestValBytes := serializeLatestValueScan(currCumulativeCount, currRange, currRelativeIndices)
-		dbKey := make([]byte, 41)
-		copy(dbKey, prefix)
-		binary.BigEndian.PutUint64(dbKey[33:], currChunkNum)
-		if err := batch.Set(dbKey, latestValBytes, pebble.NoSync); err != nil {
-			return fmt.Errorf("failed to write latest chunk %d: %w", currChunkNum, err)
+		// Write final active chunk if modified
+		if modified {
+			latestValBytes := serializeChunkValue(currRange, currRelativeIndices)
+			dbKey := make([]byte, 41)
+			copy(dbKey, prefix)
+			binary.BigEndian.PutUint64(dbKey[33:], currChunkNum)
+			if err := batch.Set(dbKey, latestValBytes, pebble.NoSync); err != nil {
+				return fmt.Errorf("failed to write latest chunk %d: %w", currChunkNum, err)
+			}
 		}
 	}
 
@@ -171,13 +177,13 @@ func (s *ChunkScanStore) Lookup(ctx context.Context, key [32]byte, start uint64)
 	prefix[0] = chunkPrefix
 	copy(prefix[1:], key[:])
 
+	// Calculate a safe lower bound start chunk number
 	startChunkNum := start / s.chunkSize
 	startKey := make([]byte, 41)
 	copy(startKey, prefix)
 	binary.BigEndian.PutUint64(startKey[33:], startChunkNum)
 
 	upperBound := prefixUpperBound(prefix)
-
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		UpperBound: upperBound,
 	})
@@ -187,37 +193,25 @@ func (s *ChunkScanStore) Lookup(ctx context.Context, key [32]byte, start uint64)
 	defer iter.Close()
 
 	var reconstructed []uint64
-	var cumulativeCount uint64
-	var foundLatest bool
+	var skippedOffset uint64
+	var skippedOffsetSet bool
 
 	for valid := iter.SeekGE(startKey); valid; valid = iter.Next() {
 		k := iter.Key()
 		if len(k) != 41 {
-			return nil, fmt.Errorf("invalid key length: %d", len(k))
+			return nil, fmt.Errorf("invalid chunk key length: %d", len(k))
 		}
 		chunkNum := binary.BigEndian.Uint64(k[33:])
 		val := iter.Value()
-		if len(val) == 0 {
-			return nil, fmt.Errorf("empty value for chunk %d", chunkNum)
+
+		r, relIndices, err := deserializeChunkValue(val)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize chunk %d: %w", chunkNum, err)
 		}
 
-		var relIndices []uint16
-		if val[0] == flagLatest {
-			cum, _, rels, err := deserializeLatestValueScan(val)
-			if err != nil {
-				return nil, fmt.Errorf("failed to deserialize latest value for chunk %d: %w", chunkNum, err)
-			}
-			relIndices = rels
-			cumulativeCount = cum
-			foundLatest = true
-		} else if val[0] == flagOlder {
-			rels, err := deserializeOlderValueScan(val)
-			if err != nil {
-				return nil, fmt.Errorf("failed to deserialize older value for chunk %d: %w", chunkNum, err)
-			}
-			relIndices = rels
-		} else {
-			return nil, fmt.Errorf("invalid flag 0x%x for chunk %d", val[0], chunkNum)
+		if !skippedOffsetSet {
+			skippedOffset = r.End()
+			skippedOffsetSet = true
 		}
 
 		for _, rel := range relIndices {
@@ -230,20 +224,15 @@ func (s *ChunkScanStore) Lookup(ctx context.Context, key [32]byte, start uint64)
 		return nil, nil
 	}
 
-	if !foundLatest {
-		return nil, fmt.Errorf("latest chunk not found for key %x", key)
+	if !skippedOffsetSet {
+		return nil, fmt.Errorf("no chunks found for key %x starting from chunk %d", key, startChunkNum)
 	}
 
-	if cumulativeCount < uint64(len(reconstructed)) {
-		return nil, fmt.Errorf("invalid cumulative count %d, less than reconstructed length %d", cumulativeCount, len(reconstructed))
+	if start < skippedOffset {
+		return nil, fmt.Errorf("invariant violated: start %d < skippedOffset %d", start, skippedOffset)
 	}
 
-	skipped := cumulativeCount - uint64(len(reconstructed))
-	if start < skipped {
-		return nil, fmt.Errorf("invariant violated: start %d < skipped %d", start, skipped)
-	}
-
-	offset := start - skipped
+	offset := start - skippedOffset
 	if offset >= uint64(len(reconstructed)) {
 		return nil, nil
 	}
@@ -253,6 +242,7 @@ func (s *ChunkScanStore) Lookup(ctx context.Context, key [32]byte, start uint64)
 
 // GetSubRoot returns the root hash of the key's index log.
 func (s *ChunkScanStore) GetSubRoot(ctx context.Context, key [32]byte) ([32]byte, error) {
+	// Share identical implementation with ChunkStore GetSubRoot
 	prefix := make([]byte, 33)
 	prefix[0] = chunkPrefix
 	copy(prefix[1:], key[:])
@@ -268,15 +258,9 @@ func (s *ChunkScanStore) GetSubRoot(ctx context.Context, key [32]byte) ([32]byte
 		k := iter.Key()
 		if bytes.HasPrefix(k, prefix) {
 			val := iter.Value()
-			if len(val) == 0 {
-				return [32]byte{}, fmt.Errorf("empty value for latest chunk of key %x", key)
-			}
-			if val[0] != flagLatest {
-				return [32]byte{}, fmt.Errorf("latest chunk for key %x is not flagged as Latest: 0x%x", key, val[0])
-			}
-			_, r, relIndices, err := deserializeLatestValueScan(val)
+			r, relIndices, err := deserializeChunkValue(val)
 			if err != nil {
-				return [32]byte{}, fmt.Errorf("failed to deserialize latest value for key %x: %w", key, err)
+				return [32]byte{}, fmt.Errorf("failed to deserialize latest chunk value for key %x: %w", key, err)
 			}
 			chunkNum := binary.BigEndian.Uint64(k[33:])
 			for _, rel := range relIndices {
@@ -307,78 +291,4 @@ func (s *ChunkScanStore) GetSubRoot(ctx context.Context, key [32]byte) ([32]byte
 	var root [32]byte
 	copy(root[:], rfc6962.DefaultHasher.EmptyRoot())
 	return root, nil
-}
-
-func serializeLatestValueScan(cumulativeCount uint64, r *compact.Range, relativeIndices []uint16) []byte {
-	serializedRange := SerializeRange(r)
-	rangeLen := len(serializedRange)
-
-	varintBuf := make([]byte, binary.MaxVarintLen64)
-	varintLen := binary.PutUvarint(varintBuf, uint64(rangeLen))
-
-	relBytes := serializeUint16Slice(relativeIndices)
-
-	buf := make([]byte, 1+8+varintLen+rangeLen+len(relBytes))
-	buf[0] = flagLatest
-	binary.BigEndian.PutUint64(buf[1:9], cumulativeCount)
-	copy(buf[9:9+varintLen], varintBuf[:varintLen])
-	copy(buf[9+varintLen:9+varintLen+rangeLen], serializedRange)
-	copy(buf[9+varintLen+rangeLen:], relBytes)
-	return buf
-}
-
-func deserializeLatestValueScan(data []byte) (uint64, *compact.Range, []uint16, error) {
-	if len(data) < 9 {
-		return 0, nil, nil, fmt.Errorf("data too short")
-	}
-	if data[0] != flagLatest {
-		return 0, nil, nil, fmt.Errorf("invalid flag: expected 0x01, got 0x%x", data[0])
-	}
-	cumulativeCount := binary.BigEndian.Uint64(data[1:9])
-
-	rangeLen, varintLen := binary.Uvarint(data[9:])
-	if varintLen <= 0 {
-		return 0, nil, nil, fmt.Errorf("invalid varint for range length")
-	}
-
-	offset := 9 + varintLen
-	if len(data) < offset+int(rangeLen) {
-		return 0, nil, nil, fmt.Errorf("data too short for compact range")
-	}
-
-	rangeBytes := data[offset : offset+int(rangeLen)]
-	r, err := DeserializeRange(rangeBytes)
-	if err != nil {
-		return 0, nil, nil, fmt.Errorf("failed to deserialize range: %w", err)
-	}
-
-	relBytes := data[offset+int(rangeLen):]
-	relIndices, err := deserializeUint16Slice(relBytes)
-	if err != nil {
-		return 0, nil, nil, fmt.Errorf("failed to deserialize relative indices: %w", err)
-	}
-
-	return cumulativeCount, r, relIndices, nil
-}
-
-func serializeOlderValueScan(relativeIndices []uint16) []byte {
-	relBytes := serializeUint16Slice(relativeIndices)
-	buf := make([]byte, 1+len(relBytes))
-	buf[0] = flagOlder
-	copy(buf[1:], relBytes)
-	return buf
-}
-
-func deserializeOlderValueScan(data []byte) ([]uint16, error) {
-	if len(data) < 1 {
-		return nil, fmt.Errorf("data too short")
-	}
-	if data[0] != flagOlder {
-		return nil, fmt.Errorf("invalid flag: expected 0x02, got 0x%x", data[0])
-	}
-	relIndices, err := deserializeUint16Slice(data[1:])
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize relative indices: %w", err)
-	}
-	return relIndices, nil
 }

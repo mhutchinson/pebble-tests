@@ -1,44 +1,51 @@
 # Pebble VIndex Storage Layout Benchmarks & Recommended Design
 
-Based on extensive benchmarking, we recommend **`PebbleChunkScan` (Chunked Log with Range Scan)** as the default storage layout for the VIndex. It provides the best balance of write throughput, read latency, and storage efficiency for mixed workloads.
+Based on extensive benchmarking, we recommend **`PebbleChunkScan` (using the No-Seal layout with chunk size 65536)** as the default storage layout for the VIndex. It provides the best balance of write throughput, read latency, and storage efficiency for mixed workloads.
 
 ## Terminology
 
-*   **Chunk / Chunk**: Synonymous terms referring to the logical partition of the index log for a specific key.
-*   **Chunk Size / Chunk Size**: The logical capacity of a chunk, defined as the number of sequence numbers (logical indices) it covers (e.g., 65536). It does **not** refer to byte size or disk space limits.
+*   **Chunk**: Logical partition of the index log for a specific key.
+*   **Chunk Size**: The logical capacity of a chunk, defined as the number of logical indices it covers (e.g., 65536).
 *   **Index / Sequence Number**: The monotonically increasing logical log sequence number (e.g., 10, 11, 20) associated with a key.
-*   **Active (Unsealed) Chunk**: The latest chunk for a key, which is still open to receive writes. Its cached compact range in the database is only updated to cover older, sealed chunks.
-*   **Sealed (Older) Chunk**: A chunk that has been closed because the log index has progressed to a new chunk boundary. Once sealed, its relative indices are finalized, compact range metadata is stripped to save space, and it becomes read-only.
+*   **Active Chunk**: The highest chunk for a key, which is still open to receive writes.
+*   **Sealed Chunk**: A chunk that has been logically closed because the index has progressed past its boundary. In the No-Seal layout, sealed chunks are never rewritten or modified.
 
-## Recommended Design: PebbleChunkScan
+## Recommended Design: PebbleChunkScan (No-Seal Layout)
 
 ### Schema Organization
 
-Data is partitioned into chunks (chunks) per key, where the chunk size (e.g., 65536) dictates the number of logical indices (sequence numbers) mapped to each chunk (i.e., chunkNum = index / chunkSize), not the byte size.
+Data is partitioned into chunks per key, where the chunk size (e.g., 65536) dictates the number of logical indices (sequence numbers) mapped to each chunk (i.e., `chunkNum = index / chunkSize`), not the byte size.
 
 *   **Keys**: `[Prefix 'c' (1B)] + [Hash(Key) (32B)] + [ChunkNum (8B, BigEndian)]`
     *   Using BigEndian for `ChunkNum` ensures that chunks for a given key are stored sequentially on disk, enabling efficient range scans.
 *   **Values**:
-    *   **Latest Chunk (active)**: `[flagLatest (1B)] [cumulativeCount (8B)] [rangeLen (varint)] [serialized compact.Range] [relativeIndices ([]uint16)]`
-        *   Contains the Merkle compact range state for incremental verification. Crucially, to optimize write performance, the serialized range in the `Latest` chunk only covers *sealed* chunks. The unsealed active chunk's elements (stored in `relativeIndices`) are hashed and appended to the range on-the-fly in memory during `GetSubRoot` queries.
-    *   **Older Chunks (sealed)**: `[flagOlder (1B)] [relativeIndices ([]uint16)]`
-        *   Merkle compact range metadata is stripped to save space. Only relative indices are stored.
+    *   **Uniform Value Schema**: `[serialized compact.Range] + [relativeIndices ([]uint16)]`
+        *   There are **no prefix flags** (no distinction between active/sealed chunks on write).
+        *   The serialized `compact.Range` in chunk $N$ represents the finalized range state covering all elements in older chunks preceding chunk $N$ (chunks $0$ to $N-1$).
+        *   The `relativeIndices` slice contains the logical offsets of elements written to this specific chunk $N$.
 
 ### Key Operations
 
 *   **Write (Append)**:
-    1.  Perform a `SeekLT` using `Prefix + Hash(Key) + 0xFFFFFFFFFFFFFFFF` to find the current latest chunk.
-    2.  Deserialize the latest chunk.
-    3.  Append new indices. A chunk is sealed when a new index crosses the logical chunk boundary (i.e. `index / chunkSize != currBlockNum`), regardless of how many elements have actually been written to the current chunk. For sparse index sequences, a chunk can be sealed containing as few as one element.
-        *   To seal: write the current chunk as `Older` (stripping the compact range metadata and writing only relative indices).
-        *   Start a new chunk for the index crossing the boundary, writing it as the `Latest` chunk.
-    4.  Commit the batch.
+    1.  **Locate Active Chunk**: Perform a `SeekLT` using `Prefix + Hash(Key) + 0xFFFFFFFFFFFFFFFF` to find the highest chunk key for the prefix. If found, this is the current active chunk.
+    2.  **Deserialize Chunk**: If the active chunk exists, deserialize its value into memory (`starting_range` and `relative_indices`). If it does not exist, initialize a new empty chunk.
+    3.  **Append & Handle Boundary**:
+        *   Iterate over new indices.
+        *   If a new index crosses the logical chunk boundary (i.e., `index / chunkSize != currChunkNum`):
+            *   If the current chunk was modified, write it to Pebble under its chunk key. Unlike the sealing design, **no sealing write** is performed on the old chunk (no stripping of ranges).
+            *   Compute the finalized compact range in memory by appending all `relative_indices` to `starting_range`.
+            *   Initialize a new chunk with `starting_range = finalized_range`, and clear `relative_indices`.
+            *   Set `currChunkNum = index / chunkSize`.
+        *   Append the relative offset `uint16(index % chunkSize)` to `relative_indices` and mark the chunk as modified.
+    4.  **Write Active Chunk**: If modified, serialize and write the final active chunk to Pebble under its key.
+    5.  **Commit Batch**: Commit all writes atomically.
 *   **Read (Lookup)**:
-    1.  Calculate the starting chunk number: `startChunk = start / chunkSize`.
-    2.  Initialize an iterator with an upper bound restricted to the key's prefix.
-    3.  Seek to `Prefix + Hash(Key) + startChunk` (`SeekGE`).
-    4.  Scan forward (`Next`) until the end of the key's prefix.
-    5.  Reconstruct absolute indices from the relative offsets in each chunk.
+    1.  **Seek Lower Bound**: Calculate the starting chunk number: `startChunkNum = start / chunkSize`. Seek `SeekGE` using `Prefix + Hash(Key) + startChunkNum` to position the iterator.
+    2.  **Scan Forward**: Scan forward using `Next` until the key's prefix boundary is reached.
+    3.  **Filter & Reconstruct**: Reconstruct absolute indices from the relative offsets in each scanned chunk. The first chunk read has a `compact.Range` whose `End()` indicates the number of skipped elements preceding the scanned range. Use this `skippedOffset` to correctly slice the returned indices starting from the requested `start` offset.
+*   **GetSubRoot**:
+    1.  **Retrieve Latest Chunk**: Seek to the highest key for the prefix.
+    2.  **Calculate Root On-The-Fly**: Deserialize the latest chunk, append all its relative indices to its compact range in memory, and return the computed root hash.
 
 ### Performance Caveats
 *   **Pure Write Latency on Hot Keys**: If the workload is exclusively writes to a very small set of keys (e.g., Mode A), the standard `PebbleChunk` (which uses point lookups and backward links) offers ~30% higher write throughput because it avoids range-scan overheads during compaction/seeks.
@@ -60,10 +67,43 @@ Data is partitioned into chunks (chunks) per key, where the chunk size (e.g., 65
     *   **Pros**: Low write amplification.
     *   **Cons**: Reads require a prefix scan. Writes require an iterator seek to find the latest index, causing severe write stalls during compactions.
 
-3.  **PebbleChunk (Chunked Log with Point Lookups)**
-    *   Similar to `PebbleChunkScan` but chunks are backward-linked (`Older` chunks contain `prevBlockNum`).
+3.  **PebbleSealingChunk (Sealing Chunked Log with Point Lookups / Backward Links)**
+    *   Uses point lookups, backward links, and writes a sealing record.
     *   **Pros**: High write throughput.
-    *   **Cons**: Reads require traversing the chain backwards via multiple random `db.Get` calls, resulting in terrible read performance for small chunk sizes.
+    *   **Cons**: Reads require traversing the chain backwards via multiple random `db.Get` calls.
+4.  **PebbleSealingChunkScan (Sealing Chunked Log with Forward Scans)**
+    *   Similar to `PebbleChunkScan` but performs an extra write to rewrite/seal the older chunk on boundary crossing.
+    *   **Pros**: Saves storage footprint by stripping range metadata from sealed chunks.
+    *   **Cons**: Degrades write throughput due to the extra write amplification.
+
+---
+
+## Sealing vs No-Seal Layout Performance Comparison
+
+We executed comparative benchmarks (Mode C, 100,000 keys, 100,000 entries, batch size 1000, 4 concurrent readers) to evaluate the impact of the **No-Seal Layout** optimization:
+
+| Workload Aspect | Sealing Scan Layout | No-Seal Scan Layout | Impact / Trade-off |
+| :--- | :---: | :---: | :--- |
+| **Write QPS** (size=256) | 19,455 | **22,429** | **+15.3% Write Speedup** |
+| **Write QPS** (size=1024) | 20,203 | **27,609** | **+36.6% Write Speedup** |
+| **Write QPS** (size=65536) | 20,840 | **26,386** | **+26.6% Write Speedup** |
+| | | | |
+| **Read QPS** (size=256) | **10,190** | 5,765 | **Sealing is 76.7% faster** (small chunks scan) |
+| **Read QPS** (size=1024) | **14,377** | 12,340 | **Sealing is 16.5% faster** |
+| **Read QPS** (size=65536) | 20,897 | **23,679** | **No-Seal is 13.3% faster** (large chunks scan) |
+| | | | |
+| **Size After Compaction** (size=256) | **1.50 MB** | 3.27 MB | **No-Seal is 2.18x larger** (range duplication) |
+| **Size After Compaction** (size=1024) | **1.44 MB** | 2.61 MB | **No-Seal is 1.81x larger** |
+| **Size After Compaction** (size=65536) | 1.12 MB | **1.08 MB** | **Identical footprint** |
+
+### Key Takeaways & Recommendations
+
+1. **Optimal Choice: No-Seal Scan Layout with Chunk Size 65536**
+   - Yields the absolute best write performance (**+26.6% write QPS**) and read performance (**+13.3% read QPS**) compared to the sealing scanner.
+   - Storage size is identical to the sealing layout because the chunk size is large enough that range duplication is negligible.
+   - Simplifies crash recovery and concurrent read visibility because we eliminate the out-of-order rewrite to the sealed chunk.
+2. **When to use Sealing Layout**:
+   - If the log is very sparse and chunk sizes must remain very small (e.g. 256), the Sealing layout is recommended to avoid $\approx 2\times$ disk space amplification and scan performance degradation caused by duplicated historical compact ranges.
 
 ---
 
