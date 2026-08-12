@@ -2,40 +2,48 @@
 
 Based on extensive benchmarking, we recommend **`PebbleChunkScan` (Chunked Log with Range Scan)** as the default storage layout for the VIndex. It provides the best balance of write throughput, read latency, and storage efficiency for mixed workloads.
 
+## Terminology
+
+*   **Chunk / Chunk**: Synonymous terms referring to the logical partition of the index log for a specific key.
+*   **Chunk Size / Chunk Size**: The logical capacity of a chunk, defined as the number of sequence numbers (logical indices) it covers (e.g., 65536). It does **not** refer to byte size or disk space limits.
+*   **Index / Sequence Number**: The monotonically increasing logical log sequence number (e.g., 10, 11, 20) associated with a key.
+*   **Active (Unsealed) Chunk**: The latest chunk for a key, which is still open to receive writes. Its cached compact range in the database is only updated to cover older, sealed chunks.
+*   **Sealed (Older) Chunk**: A chunk that has been closed because the log index has progressed to a new chunk boundary. Once sealed, its relative indices are finalized, compact range metadata is stripped to save space, and it becomes read-only.
+
 ## Recommended Design: PebbleChunkScan
 
 ### Schema Organization
 
-Data is partitioned into chunks (blocks) per key, where the chunk size (e.g., 65536) dictates the number of logical indices (sequence numbers) mapped to each block (i.e., blockNum = index / chunkSize), not the byte size.
+Data is partitioned into chunks (chunks) per key, where the chunk size (e.g., 65536) dictates the number of logical indices (sequence numbers) mapped to each chunk (i.e., chunkNum = index / chunkSize), not the byte size.
 
-*   **Keys**: `[Prefix 'c' (1B)] + [Hash(Key) (32B)] + [BlockNum (8B, BigEndian)]`
-    *   Using BigEndian for `BlockNum` ensures that blocks for a given key are stored sequentially on disk, enabling efficient range scans.
+*   **Keys**: `[Prefix 'c' (1B)] + [Hash(Key) (32B)] + [ChunkNum (8B, BigEndian)]`
+    *   Using BigEndian for `ChunkNum` ensures that chunks for a given key are stored sequentially on disk, enabling efficient range scans.
 *   **Values**:
-    *   **Latest Block (active)**: `[flagLatest (1B)] [cumulativeCount (8B)] [rangeLen (varint)] [serialized compact.Range] [relativeIndices ([]uint16)]`
-        *   Contains the Merkle compact range state for incremental verification. Crucially, to optimize write performance, the serialized range in the `Latest` block only covers *sealed* blocks. The unsealed active block's elements (stored in `relativeIndices`) are hashed and appended to the range on-the-fly in memory during `GetSubRoot` queries.
-    *   **Older Blocks (sealed)**: `[flagOlder (1B)] [relativeIndices ([]uint16)]`
+    *   **Latest Chunk (active)**: `[flagLatest (1B)] [cumulativeCount (8B)] [rangeLen (varint)] [serialized compact.Range] [relativeIndices ([]uint16)]`
+        *   Contains the Merkle compact range state for incremental verification. Crucially, to optimize write performance, the serialized range in the `Latest` chunk only covers *sealed* chunks. The unsealed active chunk's elements (stored in `relativeIndices`) are hashed and appended to the range on-the-fly in memory during `GetSubRoot` queries.
+    *   **Older Chunks (sealed)**: `[flagOlder (1B)] [relativeIndices ([]uint16)]`
         *   Merkle compact range metadata is stripped to save space. Only relative indices are stored.
 
 ### Key Operations
 
 *   **Write (Append)**:
-    1.  Perform a `SeekLT` using `Prefix + Hash(Key) + 0xFFFFFFFFFFFFFFFF` to find the current latest block.
-    2.  Deserialize the latest block.
-    3.  Append new indices. A block is sealed when a new index crosses the logical block boundary (i.e. `index / chunkSize != currBlockNum`), regardless of how many elements have actually been written to the current block. For sparse index sequences, a block can be sealed containing as few as one element.
-        *   To seal: write the current block as `Older` (stripping the compact range metadata and writing only relative indices).
-        *   Start a new block for the index crossing the boundary, writing it as the `Latest` block.
+    1.  Perform a `SeekLT` using `Prefix + Hash(Key) + 0xFFFFFFFFFFFFFFFF` to find the current latest chunk.
+    2.  Deserialize the latest chunk.
+    3.  Append new indices. A chunk is sealed when a new index crosses the logical chunk boundary (i.e. `index / chunkSize != currBlockNum`), regardless of how many elements have actually been written to the current chunk. For sparse index sequences, a chunk can be sealed containing as few as one element.
+        *   To seal: write the current chunk as `Older` (stripping the compact range metadata and writing only relative indices).
+        *   Start a new chunk for the index crossing the boundary, writing it as the `Latest` chunk.
     4.  Commit the batch.
 *   **Read (Lookup)**:
-    1.  Calculate the starting block number: `startBlock = start / chunkSize`.
+    1.  Calculate the starting chunk number: `startChunk = start / chunkSize`.
     2.  Initialize an iterator with an upper bound restricted to the key's prefix.
-    3.  Seek to `Prefix + Hash(Key) + startBlock` (`SeekGE`).
+    3.  Seek to `Prefix + Hash(Key) + startChunk` (`SeekGE`).
     4.  Scan forward (`Next`) until the end of the key's prefix.
-    5.  Reconstruct absolute indices from the relative offsets in each block.
+    5.  Reconstruct absolute indices from the relative offsets in each chunk.
 
 ### Performance Caveats
 *   **Pure Write Latency on Hot Keys**: If the workload is exclusively writes to a very small set of keys (e.g., Mode A), the standard `PebbleChunk` (which uses point lookups and backward links) offers ~30% higher write throughput because it avoids range-scan overheads during compaction/seeks.
 *   **Chunk Size Trade-off**: 
-    *   Larger chunk sizes (e.g., 65536) optimize read performance (fewer blocks to scan) but degrade write throughput for hot keys due to the overhead of serializing larger blocks on every write.
+    *   Larger chunk sizes (e.g., 65536) optimize read performance (fewer chunks to scan) but degrade write throughput for hot keys due to the overhead of serializing larger chunks on every write.
     *   A chunk size of **1024** or **65536** is recommended depending on whether writes or reads are the primary bottleneck.
 
 ---
@@ -53,7 +61,7 @@ Data is partitioned into chunks (blocks) per key, where the chunk size (e.g., 65
     *   **Cons**: Reads require a prefix scan. Writes require an iterator seek to find the latest index, causing severe write stalls during compactions.
 
 3.  **PebbleChunk (Chunked Log with Point Lookups)**
-    *   Similar to `PebbleChunkScan` but blocks are backward-linked (`Older` blocks contain `prevBlockNum`).
+    *   Similar to `PebbleChunkScan` but chunks are backward-linked (`Older` chunks contain `prevBlockNum`).
     *   **Pros**: High write throughput.
     *   **Cons**: Reads require traversing the chain backwards via multiple random `db.Get` calls, resulting in terrible read performance for small chunk sizes.
 
@@ -169,4 +177,4 @@ The benchmarks were run with 1,000,000 entries, Mode C (100,000 keys), and 5 con
 
 Introducing 5 concurrent readers roughly halves the write throughput across all engines compared to the write-only Mode C benchmark (e.g., `log` falls from approx. 30k to approx. 17.6k write QPS). 
 
-The `flat` engine continues to provide the lowest read latency (approx. 113µs p50) but suffers from high write latency. Among the chunked engines, `chunk (size=65536)` offers much better read performance (2,285 QPS, 1.68ms p50) than smaller chunk sizes which suffer from traversing long chains of backward-linked blocks. However, `chunk (size=65536)`'s write throughput (approx. 8.5k QPS) is significantly lower than smaller chunk sizes because the larger chunk size allows hot key blocks to grow large (up to 128KB), increasing serialization and write overhead.
+The `flat` engine continues to provide the lowest read latency (approx. 113µs p50) but suffers from high write latency. Among the chunked engines, `chunk (size=65536)` offers much better read performance (2,285 QPS, 1.68ms p50) than smaller chunk sizes which suffer from traversing long chains of backward-linked chunks. However, `chunk (size=65536)`'s write throughput (approx. 8.5k QPS) is significantly lower than smaller chunk sizes because the larger chunk size allows hot key chunks to grow large (up to 128KB), increasing serialization and write overhead.

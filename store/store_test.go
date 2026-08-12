@@ -354,19 +354,19 @@ func TestChunkStoreRawInspection(t *testing.T) {
 	ctx := context.Background()
 	key := sha256.Sum256([]byte("inspect-key"))
 
-	// Write first batch: index 10, 11 (both block 5)
+	// Write first batch: index 10, 11 (both chunk 5)
 	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {10, 11}}); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
 
-	// Verify block 5 is latest
+	// Verify chunk 5 is latest
 	prefix := make([]byte, 33)
 	prefix[0] = chunkPrefix
 	copy(prefix[1:], key[:])
 
-	keyBlock5 := make([]byte, 41)
-	copy(keyBlock5, prefix)
-	binary.BigEndian.PutUint64(keyBlock5[33:], 5)
+	keyChunk5 := make([]byte, 41)
+	copy(keyChunk5, prefix)
+	binary.BigEndian.PutUint64(keyChunk5[33:], 5)
 
 	getRaw := func(k []byte) []byte {
 		val, closer, err := s.db.Get(k)
@@ -379,41 +379,41 @@ func TestChunkStoreRawInspection(t *testing.T) {
 		return ret
 	}
 
-	val5 := getRaw(keyBlock5)
-	p5PrevBlockNum, p5CumulativeCount, range5, _, err := deserializeLatestValue(val5)
+	val5 := getRaw(keyChunk5)
+	p5PrevChunkNum, p5CumulativeCount, range5, _, err := deserializeLatestValue(val5)
 	if err != nil {
-		t.Fatalf("Failed to deserialize latest value for block 5: %v", err)
+		t.Fatalf("Failed to deserialize latest value for chunk 5: %v", err)
 	}
-	if p5PrevBlockNum != 0 {
-		t.Errorf("Expected block 5 prev to be 0, got %d", p5PrevBlockNum)
+	if p5PrevChunkNum != 0 {
+		t.Errorf("Expected chunk 5 prev to be 0, got %d", p5PrevChunkNum)
 	}
 	if p5CumulativeCount != 2 {
-		t.Errorf("Expected block 5 cumulative count to be 2, got %d", p5CumulativeCount)
+		t.Errorf("Expected chunk 5 cumulative count to be 2, got %d", p5CumulativeCount)
 	}
 	if range5.End() != 0 {
-		t.Errorf("Expected block 5 range end to be 0, got %d", range5.End())
+		t.Errorf("Expected chunk 5 range end to be 0, got %d", range5.End())
 	}
 
-	// Write second batch: index 20 (block 10)
+	// Write second batch: index 20 (chunk 10)
 	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {20}}); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
 
-	// Verify block 5 is now older (0x02)
-	val5Older := getRaw(keyBlock5)
+	// Verify chunk 5 is now older (0x02)
+	val5Older := getRaw(keyChunk5)
 	if len(val5Older) < 17 {
 		t.Fatalf("Value too short: %d", len(val5Older))
 	}
 	if val5Older[0] != flagOlder {
-		t.Errorf("Expected block 5 to be older (0x02), got %x", val5Older[0])
+		t.Errorf("Expected chunk 5 to be older (0x02), got %x", val5Older[0])
 	}
 	prev5Older := binary.BigEndian.Uint64(val5Older[1:9])
 	if prev5Older != 0 {
-		t.Errorf("Expected block 5 older prev to be 0, got %d", prev5Older)
+		t.Errorf("Expected chunk 5 older prev to be 0, got %d", prev5Older)
 	}
 	cum5Older := binary.BigEndian.Uint64(val5Older[9:17])
 	if cum5Older != 2 {
-		t.Errorf("Expected block 5 older cumulative count to be 2, got %d", cum5Older)
+		t.Errorf("Expected chunk 5 older cumulative count to be 2, got %d", cum5Older)
 	}
 
 	localDeserializeUint16Slice := func(buf []byte) []uint16 {
@@ -429,24 +429,24 @@ func TestChunkStoreRawInspection(t *testing.T) {
 		t.Errorf("Expected rel indices [0, 1], got %v", rel5Older)
 	}
 
-	// Verify block 10 is latest (0x01)
-	keyBlock10 := make([]byte, 41)
-	copy(keyBlock10, prefix)
-	binary.BigEndian.PutUint64(keyBlock10[33:], 10)
+	// Verify chunk 10 is latest (0x01)
+	keyChunk10 := make([]byte, 41)
+	copy(keyChunk10, prefix)
+	binary.BigEndian.PutUint64(keyChunk10[33:], 10)
 
-	val10 := getRaw(keyBlock10)
-	p10PrevBlockNum, p10CumulativeCount, range10, _, err := deserializeLatestValue(val10)
+	val10 := getRaw(keyChunk10)
+	p10PrevChunkNum, p10CumulativeCount, range10, _, err := deserializeLatestValue(val10)
 	if err != nil {
-		t.Fatalf("Failed to deserialize latest value for block 10: %v", err)
+		t.Fatalf("Failed to deserialize latest value for chunk 10: %v", err)
 	}
-	if p10PrevBlockNum != 5 {
-		t.Errorf("Expected block 10 prev to be 5, got %d", p10PrevBlockNum)
+	if p10PrevChunkNum != 5 {
+		t.Errorf("Expected chunk 10 prev to be 5, got %d", p10PrevChunkNum)
 	}
 	if p10CumulativeCount != 3 {
-		t.Errorf("Expected block 10 cumulative count to be 3, got %d", p10CumulativeCount)
+		t.Errorf("Expected chunk 10 cumulative count to be 3, got %d", p10CumulativeCount)
 	}
 	if range10.End() != 2 {
-		t.Errorf("Expected block 10 range end to be 2, got %d", range10.End())
+		t.Errorf("Expected chunk 10 range end to be 2, got %d", range10.End())
 	}
 }
 
@@ -541,19 +541,19 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 	ctx := context.Background()
 	key := sha256.Sum256([]byte("inspect-key"))
 
-	// Write first batch: index 10, 11 (both block 5)
+	// Write first batch: index 10, 11 (both chunk 5)
 	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {10, 11}}); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
 
-	// Verify block 5 is latest
+	// Verify chunk 5 is latest
 	prefix := make([]byte, 33)
 	prefix[0] = chunkPrefix
 	copy(prefix[1:], key[:])
 
-	keyBlock5 := make([]byte, 41)
-	copy(keyBlock5, prefix)
-	binary.BigEndian.PutUint64(keyBlock5[33:], 5)
+	keyChunk5 := make([]byte, 41)
+	copy(keyChunk5, prefix)
+	binary.BigEndian.PutUint64(keyChunk5[33:], 5)
 
 	getRaw := func(k []byte) []byte {
 		val, closer, err := s.db.Get(k)
@@ -566,22 +566,22 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 		return ret
 	}
 
-	val5 := getRaw(keyBlock5)
+	val5 := getRaw(keyChunk5)
 	if len(val5) < 9 {
 		t.Fatalf("Value too short: %d", len(val5))
 	}
 	if val5[0] != flagLatest {
-		t.Errorf("Expected block 5 to be latest (0x01), got %x", val5[0])
+		t.Errorf("Expected chunk 5 to be latest (0x01), got %x", val5[0])
 	}
 	cum5 := binary.BigEndian.Uint64(val5[1:9])
 	if cum5 != 2 {
-		t.Errorf("Expected block 5 cumulative count to be 2, got %d", cum5)
+		t.Errorf("Expected chunk 5 cumulative count to be 2, got %d", cum5)
 	}
 
 	// Range and rel indices check
 	_, range5, rel5, err := deserializeLatestValueScan(val5)
 	if err != nil {
-		t.Fatalf("Failed to deserialize latest value for block 5: %v", err)
+		t.Fatalf("Failed to deserialize latest value for chunk 5: %v", err)
 	}
 	if range5.End() != 0 {
 		t.Errorf("Expected range end to be 0, got %d", range5.End())
@@ -590,23 +590,23 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 		t.Errorf("Expected rel indices [0, 1], got %v", rel5)
 	}
 
-	// Write second batch: index 20 (block 10)
+	// Write second batch: index 20 (chunk 10)
 	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {20}}); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
 
-	// Verify block 5 is now older (0x02)
-	val5Older := getRaw(keyBlock5)
+	// Verify chunk 5 is now older (0x02)
+	val5Older := getRaw(keyChunk5)
 	if len(val5Older) == 0 {
 		t.Fatalf("Value is empty")
 	}
 	if val5Older[0] != flagOlder {
-		t.Errorf("Expected block 5 to be older (0x02), got %x", val5Older[0])
+		t.Errorf("Expected chunk 5 to be older (0x02), got %x", val5Older[0])
 	}
 	// Older value schema: 0x02 (1B) + []uint16 (relative indices)
 	// For chunkSize=2, rel indices [0, 1] takes 4 bytes. Total length = 5.
 	if len(val5Older) != 5 {
-		t.Errorf("Expected older block 5 value length to be 5, got %d", len(val5Older))
+		t.Errorf("Expected older chunk 5 value length to be 5, got %d", len(val5Older))
 	}
 
 	rel5Older, err := deserializeOlderValueScan(val5Older)
@@ -617,26 +617,26 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 		t.Errorf("Expected rel indices [0, 1], got %v", rel5Older)
 	}
 
-	// Verify block 10 is latest (0x01)
-	keyBlock10 := make([]byte, 41)
-	copy(keyBlock10, prefix)
-	binary.BigEndian.PutUint64(keyBlock10[33:], 10)
+	// Verify chunk 10 is latest (0x01)
+	keyChunk10 := make([]byte, 41)
+	copy(keyChunk10, prefix)
+	binary.BigEndian.PutUint64(keyChunk10[33:], 10)
 
-	val10 := getRaw(keyBlock10)
+	val10 := getRaw(keyChunk10)
 	if len(val10) < 9 {
 		t.Fatalf("Value too short: %d", len(val10))
 	}
 	if val10[0] != flagLatest {
-		t.Errorf("Expected block 10 to be latest (0x01), got %x", val10[0])
+		t.Errorf("Expected chunk 10 to be latest (0x01), got %x", val10[0])
 	}
 	cum10 := binary.BigEndian.Uint64(val10[1:9])
 	if cum10 != 3 {
-		t.Errorf("Expected block 10 cumulative count to be 3, got %d", cum10)
+		t.Errorf("Expected chunk 10 cumulative count to be 3, got %d", cum10)
 	}
 
 	_, range10, rel10, err := deserializeLatestValueScan(val10)
 	if err != nil {
-		t.Fatalf("Failed to deserialize latest value for block 10: %v", err)
+		t.Fatalf("Failed to deserialize latest value for chunk 10: %v", err)
 	}
 	if range10.End() != 2 {
 		t.Errorf("Expected range end to be 2, got %d", range10.End())
@@ -711,7 +711,7 @@ func TestCrossEngineConsistency(t *testing.T) {
 			key2: {2, 4},
 		},
 		{
-			key1: {7, 8, 12, 13}, // seals a block on chunk size 4
+			key1: {7, 8, 12, 13}, // seals a chunk on chunk size 4
 			key2: {6, 9},
 		},
 		{

@@ -64,7 +64,7 @@ func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]
 		prefix[0] = chunkPrefix
 		copy(prefix[1:], key[:])
 
-		// Find previous latest block
+		// Find previous latest chunk
 		upperBound := prefixUpperBound(prefix)
 		iter, err := s.db.NewIter(&pebble.IterOptions{})
 		if err != nil {
@@ -87,7 +87,7 @@ func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]
 			return fmt.Errorf("failed to close iterator: %w", err)
 		}
 
-		var currBlockNum uint64
+		var currChunkNum uint64
 		var currRange *compact.Range
 		var currRelativeIndices []uint16
 		var currCumulativeCount uint64
@@ -97,30 +97,30 @@ func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]
 			if len(prevKey) != 41 {
 				return fmt.Errorf("invalid prevKey length: %d", len(prevKey))
 			}
-			prevBlockNum := binary.BigEndian.Uint64(prevKey[33:])
+			prevChunkNum := binary.BigEndian.Uint64(prevKey[33:])
 
 			pCumulativeCount, pRange, pRelIndices, err := deserializeLatestValueScan(prevVal)
 			if err != nil {
-				return fmt.Errorf("failed to deserialize latest value for key %x, block %d: %w", key, prevBlockNum, err)
+				return fmt.Errorf("failed to deserialize latest value for key %x, chunk %d: %w", key, prevChunkNum, err)
 			}
 
-			currBlockNum = prevBlockNum
+			currChunkNum = prevChunkNum
 			currCumulativeCount = pCumulativeCount
 			currRange = pRange
 			currRelativeIndices = pRelIndices
 		} else {
-			currBlockNum = newIndices[0] / s.chunkSize
+			currChunkNum = newIndices[0] / s.chunkSize
 			currRange = fact.NewEmptyRange(0)
 			currRelativeIndices = []uint16{}
 			currCumulativeCount = 0
 		}
 
 		for _, idx := range newIndices {
-			blockNum := idx / s.chunkSize
-			if blockNum != currBlockNum {
+			chunkNum := idx / s.chunkSize
+			if chunkNum != currChunkNum {
 				// Reconstruct absolute indices and append leaf hashes to currRange
 				for _, rel := range currRelativeIndices {
-					abs := currBlockNum*s.chunkSize + uint64(rel)
+					abs := currChunkNum*s.chunkSize + uint64(rel)
 					var idxBytes [8]byte
 					binary.BigEndian.PutUint64(idxBytes[:], abs)
 					leafHash := rfc6962.DefaultHasher.HashLeaf(idxBytes[:])
@@ -129,17 +129,17 @@ func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]
 					}
 				}
 
-				// Seal current block as Older
+				// Seal current chunk as Older
 				olderValBytes := serializeOlderValueScan(currRelativeIndices)
 				dbKey := make([]byte, 41)
 				copy(dbKey, prefix)
-				binary.BigEndian.PutUint64(dbKey[33:], currBlockNum)
+				binary.BigEndian.PutUint64(dbKey[33:], currChunkNum)
 				if err := batch.Set(dbKey, olderValBytes, pebble.NoSync); err != nil {
-					return fmt.Errorf("failed to seal block %d as older: %w", currBlockNum, err)
+					return fmt.Errorf("failed to seal chunk %d as older: %w", currChunkNum, err)
 				}
 
-				// Set up new block
-				currBlockNum = blockNum
+				// Set up new chunk
+				currChunkNum = chunkNum
 				currRelativeIndices = []uint16{}
 			}
 
@@ -148,13 +148,13 @@ func (s *ChunkScanStore) WriteBatch(ctx context.Context, updates map[[32]byte][]
 			currCumulativeCount++
 		}
 
-		// Write final block as Latest
+		// Write final chunk as Latest
 		latestValBytes := serializeLatestValueScan(currCumulativeCount, currRange, currRelativeIndices)
 		dbKey := make([]byte, 41)
 		copy(dbKey, prefix)
-		binary.BigEndian.PutUint64(dbKey[33:], currBlockNum)
+		binary.BigEndian.PutUint64(dbKey[33:], currChunkNum)
 		if err := batch.Set(dbKey, latestValBytes, pebble.NoSync); err != nil {
-			return fmt.Errorf("failed to write latest block %d: %w", currBlockNum, err)
+			return fmt.Errorf("failed to write latest chunk %d: %w", currChunkNum, err)
 		}
 	}
 
@@ -171,10 +171,10 @@ func (s *ChunkScanStore) Lookup(ctx context.Context, key [32]byte, start uint64)
 	prefix[0] = chunkPrefix
 	copy(prefix[1:], key[:])
 
-	startBlockNum := start / s.chunkSize
+	startChunkNum := start / s.chunkSize
 	startKey := make([]byte, 41)
 	copy(startKey, prefix)
-	binary.BigEndian.PutUint64(startKey[33:], startBlockNum)
+	binary.BigEndian.PutUint64(startKey[33:], startChunkNum)
 
 	upperBound := prefixUpperBound(prefix)
 
@@ -195,17 +195,17 @@ func (s *ChunkScanStore) Lookup(ctx context.Context, key [32]byte, start uint64)
 		if len(k) != 41 {
 			return nil, fmt.Errorf("invalid key length: %d", len(k))
 		}
-		blockNum := binary.BigEndian.Uint64(k[33:])
+		chunkNum := binary.BigEndian.Uint64(k[33:])
 		val := iter.Value()
 		if len(val) == 0 {
-			return nil, fmt.Errorf("empty value for block %d", blockNum)
+			return nil, fmt.Errorf("empty value for chunk %d", chunkNum)
 		}
 
 		var relIndices []uint16
 		if val[0] == flagLatest {
 			cum, _, rels, err := deserializeLatestValueScan(val)
 			if err != nil {
-				return nil, fmt.Errorf("failed to deserialize latest value for block %d: %w", blockNum, err)
+				return nil, fmt.Errorf("failed to deserialize latest value for chunk %d: %w", chunkNum, err)
 			}
 			relIndices = rels
 			cumulativeCount = cum
@@ -213,15 +213,15 @@ func (s *ChunkScanStore) Lookup(ctx context.Context, key [32]byte, start uint64)
 		} else if val[0] == flagOlder {
 			rels, err := deserializeOlderValueScan(val)
 			if err != nil {
-				return nil, fmt.Errorf("failed to deserialize older value for block %d: %w", blockNum, err)
+				return nil, fmt.Errorf("failed to deserialize older value for chunk %d: %w", chunkNum, err)
 			}
 			relIndices = rels
 		} else {
-			return nil, fmt.Errorf("invalid flag 0x%x for block %d", val[0], blockNum)
+			return nil, fmt.Errorf("invalid flag 0x%x for chunk %d", val[0], chunkNum)
 		}
 
 		for _, rel := range relIndices {
-			abs := blockNum*s.chunkSize + uint64(rel)
+			abs := chunkNum*s.chunkSize + uint64(rel)
 			reconstructed = append(reconstructed, abs)
 		}
 	}
@@ -231,7 +231,7 @@ func (s *ChunkScanStore) Lookup(ctx context.Context, key [32]byte, start uint64)
 	}
 
 	if !foundLatest {
-		return nil, fmt.Errorf("latest block not found for key %x", key)
+		return nil, fmt.Errorf("latest chunk not found for key %x", key)
 	}
 
 	if cumulativeCount < uint64(len(reconstructed)) {
@@ -269,18 +269,18 @@ func (s *ChunkScanStore) GetSubRoot(ctx context.Context, key [32]byte) ([32]byte
 		if bytes.HasPrefix(k, prefix) {
 			val := iter.Value()
 			if len(val) == 0 {
-				return [32]byte{}, fmt.Errorf("empty value for latest block of key %x", key)
+				return [32]byte{}, fmt.Errorf("empty value for latest chunk of key %x", key)
 			}
 			if val[0] != flagLatest {
-				return [32]byte{}, fmt.Errorf("latest block for key %x is not flagged as Latest: 0x%x", key, val[0])
+				return [32]byte{}, fmt.Errorf("latest chunk for key %x is not flagged as Latest: 0x%x", key, val[0])
 			}
 			_, r, relIndices, err := deserializeLatestValueScan(val)
 			if err != nil {
 				return [32]byte{}, fmt.Errorf("failed to deserialize latest value for key %x: %w", key, err)
 			}
-			blockNum := binary.BigEndian.Uint64(k[33:])
+			chunkNum := binary.BigEndian.Uint64(k[33:])
 			for _, rel := range relIndices {
-				abs := blockNum*s.chunkSize + uint64(rel)
+				abs := chunkNum*s.chunkSize + uint64(rel)
 				var idxBytes [8]byte
 				binary.BigEndian.PutUint64(idxBytes[:], abs)
 				leafHash := rfc6962.DefaultHasher.HashLeaf(idxBytes[:])
