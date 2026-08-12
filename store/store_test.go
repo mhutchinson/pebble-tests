@@ -380,19 +380,18 @@ func TestChunkStoreRawInspection(t *testing.T) {
 	}
 
 	val5 := getRaw(keyBlock5)
-	if len(val5) < 17 {
-		t.Fatalf("Value too short: %d", len(val5))
+	p5PrevBlockNum, p5CumulativeCount, range5, _, err := deserializeLatestValue(val5)
+	if err != nil {
+		t.Fatalf("Failed to deserialize latest value for block 5: %v", err)
 	}
-	if val5[0] != flagLatest {
-		t.Errorf("Expected block 5 to be latest (0x01), got %x", val5[0])
+	if p5PrevBlockNum != 0 {
+		t.Errorf("Expected block 5 prev to be 0, got %d", p5PrevBlockNum)
 	}
-	prev5 := binary.BigEndian.Uint64(val5[1:9])
-	if prev5 != 0 {
-		t.Errorf("Expected block 5 prev to be 0, got %d", prev5)
+	if p5CumulativeCount != 2 {
+		t.Errorf("Expected block 5 cumulative count to be 2, got %d", p5CumulativeCount)
 	}
-	cum5 := binary.BigEndian.Uint64(val5[9:17])
-	if cum5 != 2 {
-		t.Errorf("Expected block 5 cumulative count to be 2, got %d", cum5)
+	if range5.End() != 0 {
+		t.Errorf("Expected block 5 range end to be 0, got %d", range5.End())
 	}
 
 	// Write second batch: index 20 (block 10)
@@ -436,19 +435,18 @@ func TestChunkStoreRawInspection(t *testing.T) {
 	binary.BigEndian.PutUint64(keyBlock10[33:], 10)
 
 	val10 := getRaw(keyBlock10)
-	if len(val10) < 17 {
-		t.Fatalf("Value too short: %d", len(val10))
+	p10PrevBlockNum, p10CumulativeCount, range10, _, err := deserializeLatestValue(val10)
+	if err != nil {
+		t.Fatalf("Failed to deserialize latest value for block 10: %v", err)
 	}
-	if val10[0] != flagLatest {
-		t.Errorf("Expected block 10 to be latest (0x01), got %x", val10[0])
+	if p10PrevBlockNum != 5 {
+		t.Errorf("Expected block 10 prev to be 5, got %d", p10PrevBlockNum)
 	}
-	prev10 := binary.BigEndian.Uint64(val10[1:9])
-	if prev10 != 5 {
-		t.Errorf("Expected block 10 prev to be 5, got %d", prev10)
+	if p10CumulativeCount != 3 {
+		t.Errorf("Expected block 10 cumulative count to be 3, got %d", p10CumulativeCount)
 	}
-	cum10 := binary.BigEndian.Uint64(val10[9:17])
-	if cum10 != 3 {
-		t.Errorf("Expected block 10 cumulative count to be 3, got %d", cum10)
+	if range10.End() != 2 {
+		t.Errorf("Expected block 10 range end to be 2, got %d", range10.End())
 	}
 }
 
@@ -585,8 +583,8 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to deserialize latest value for block 5: %v", err)
 	}
-	if range5.End() != 2 {
-		t.Errorf("Expected range end to be 2, got %d", range5.End())
+	if range5.End() != 0 {
+		t.Errorf("Expected range end to be 0, got %d", range5.End())
 	}
 	if !equalUint16Slices(rel5, []uint16{0, 1}) {
 		t.Errorf("Expected rel indices [0, 1], got %v", rel5)
@@ -640,8 +638,8 @@ func TestChunkScanStoreRawInspection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to deserialize latest value for block 10: %v", err)
 	}
-	if range10.End() != 3 {
-		t.Errorf("Expected range end to be 3, got %d", range10.End())
+	if range10.End() != 2 {
+		t.Errorf("Expected range end to be 2, got %d", range10.End())
 	}
 	if !equalUint16Slices(rel10, []uint16{0}) {
 		t.Errorf("Expected rel indices [0], got %v", rel10)
@@ -676,5 +674,96 @@ func TestNewChunkScanStoreInvalidChunkSize(t *testing.T) {
 		t.Errorf("Unexpected error for chunkSize = 65536: %v", err)
 	} else {
 		s2.Close()
+	}
+}
+
+func TestCrossEngineConsistency(t *testing.T) {
+	ctx := context.Background()
+	key1 := sha256.Sum256([]byte("consistent-key-1"))
+	key2 := sha256.Sum256([]byte("consistent-key-2"))
+
+	// Create temp directories
+	dirFlat, _ := os.MkdirTemp("", "pebble-consistency-flat-*")
+	defer os.RemoveAll(dirFlat)
+	dirLog, _ := os.MkdirTemp("", "pebble-consistency-log-*")
+	defer os.RemoveAll(dirLog)
+	dirChunk, _ := os.MkdirTemp("", "pebble-consistency-chunk-*")
+	defer os.RemoveAll(dirChunk)
+	dirScan, _ := os.MkdirTemp("", "pebble-consistency-scan-*")
+	defer os.RemoveAll(dirScan)
+
+	sFlat, _ := NewFlatStore(dirFlat)
+	defer sFlat.Close()
+	sLog, _ := NewLogStore(dirLog)
+	defer sLog.Close()
+	sChunk, _ := NewChunkStore(dirChunk, 4) // chunk size 4
+	defer sChunk.Close()
+	sScan, _ := NewChunkScanStore(dirScan, 4) // chunk size 4
+	defer sScan.Close()
+
+	stores := []IndexStore{sFlat, sLog, sChunk, sScan}
+	names := []string{"FlatStore", "LogStore", "ChunkStore", "ChunkScanStore"}
+
+	// Sequence of writes
+	batches := []map[[32]byte][]uint64{
+		{
+			key1: {1, 3, 5},
+			key2: {2, 4},
+		},
+		{
+			key1: {7, 8, 12, 13}, // seals a block on chunk size 4
+			key2: {6, 9},
+		},
+		{
+			key1: {14, 15, 20},
+			key2: {10},
+		},
+	}
+
+	for _, batch := range batches {
+		for i, s := range stores {
+			if err := s.WriteBatch(ctx, batch); err != nil {
+				t.Fatalf("%s WriteBatch failed: %v", names[i], err)
+			}
+		}
+	}
+
+	// Verify Lookups are consistent
+	for _, key := range [][32]byte{key1, key2} {
+		for start := uint64(0); start <= 15; start++ {
+			var got [][]uint64
+			for i, s := range stores {
+				res, err := s.Lookup(ctx, key, start)
+				if err != nil {
+					t.Fatalf("%s Lookup failed for start=%d: %v", names[i], start, err)
+				}
+				got = append(got, res)
+			}
+			// Compare all results to first
+			for i := 1; i < len(stores); i++ {
+				if !equalSlices(got[i], got[0]) {
+					t.Errorf("Lookup inconsistency for key %x start %d: %s got %v, %s got %v",
+						key[:4], start, names[i], got[i], names[0], got[0])
+				}
+			}
+		}
+	}
+
+	// Verify GetSubRoots are consistent
+	for _, key := range [][32]byte{key1, key2} {
+		var got [][32]byte
+		for i, s := range stores {
+			res, err := s.GetSubRoot(ctx, key)
+			if err != nil {
+				t.Fatalf("%s GetSubRoot failed: %v", names[i], err)
+			}
+			got = append(got, res)
+		}
+		for i := 1; i < len(stores); i++ {
+			if got[i] != got[0] {
+				t.Errorf("GetSubRoot inconsistency for key %x: %s got %x, %s got %x",
+					key[:4], names[i], got[i], names[0], got[0])
+			}
+		}
 	}
 }

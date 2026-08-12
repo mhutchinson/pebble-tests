@@ -12,7 +12,7 @@ Data is partitioned into fixed-size chunks (blocks) per key.
     *   Using BigEndian for `BlockNum` ensures that blocks for a given key are stored sequentially on disk, enabling efficient range scans.
 *   **Values**:
     *   **Latest Block (active)**: `[flagLatest (1B)] [cumulativeCount (8B)] [rangeLen (varint)] [serialized compact.Range] [relativeIndices ([]uint16)]`
-        *   Contains the Merkle compact range state for incremental verification.
+        *   Contains the Merkle compact range state for incremental verification. Crucially, to optimize write performance, the serialized range in the `Latest` block only covers *sealed* blocks. The unsealed active block's elements (stored in `relativeIndices`) are hashed and appended to the range on-the-fly in memory during `GetSubRoot` queries.
     *   **Older Blocks (sealed)**: `[flagOlder (1B)] [relativeIndices ([]uint16)]`
         *   Merkle compact range metadata is stripped to save space. Only relative indices are stored.
 

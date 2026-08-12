@@ -54,6 +54,13 @@ func (s *ChunkStore) WriteBatch(ctx context.Context, updates map[[32]byte][]uint
 			continue
 		}
 
+		// Validate that newIndices are sorted
+		for i := 1; i < len(newIndices); i++ {
+			if newIndices[i] < newIndices[i-1] {
+				return fmt.Errorf("indices are not sorted: key %x, index at %d (%d) < previous (%d)", key, i, newIndices[i], newIndices[i-1])
+			}
+		}
+
 		prefix := make([]byte, 33)
 		prefix[0] = chunkPrefix
 		copy(prefix[1:], key[:])
@@ -115,6 +122,17 @@ func (s *ChunkStore) WriteBatch(ctx context.Context, updates map[[32]byte][]uint
 		for _, idx := range newIndices {
 			blockNum := idx / s.chunkSize
 			if blockNum != currBlockNum {
+				// Reconstruct absolute indices and append leaf hashes to currRange
+				for _, rel := range currRelativeIndices {
+					abs := currBlockNum*s.chunkSize + uint64(rel)
+					var idxBytes [8]byte
+					binary.BigEndian.PutUint64(idxBytes[:], abs)
+					leafHash := rfc6962.DefaultHasher.HashLeaf(idxBytes[:])
+					if err := currRange.Append(leafHash, nil); err != nil {
+						return fmt.Errorf("failed to append leaf hash for index %d on seal: %w", abs, err)
+					}
+				}
+
 				// Seal current block as Older
 				olderValBytes := serializeOlderValue(currPrevBlockNum, currCumulativeCount, currRelativeIndices)
 				dbKey := make([]byte, 41)
@@ -133,13 +151,6 @@ func (s *ChunkStore) WriteBatch(ctx context.Context, updates map[[32]byte][]uint
 			relIdx := uint16(idx % s.chunkSize)
 			currRelativeIndices = append(currRelativeIndices, relIdx)
 			currCumulativeCount++
-
-			var idxBytes [8]byte
-			binary.BigEndian.PutUint64(idxBytes[:], idx)
-			leafHash := rfc6962.DefaultHasher.HashLeaf(idxBytes[:])
-			if err := currRange.Append(leafHash, nil); err != nil {
-				return fmt.Errorf("failed to append leaf hash for index %d: %w", idx, err)
-			}
 		}
 
 		// Write final block as Latest
@@ -257,6 +268,9 @@ func (s *ChunkStore) Lookup(ctx context.Context, key [32]byte, start uint64) ([]
 	}
 
 	oldestBlock := blocks[len(blocks)-1]
+	if oldestBlock.cumulativeCount < uint64(len(oldestBlock.rel)) {
+		return nil, fmt.Errorf("database corruption: oldest block cumulative count %d is less than block relative indices length %d", oldestBlock.cumulativeCount, len(oldestBlock.rel))
+	}
 	startOffsetInOldest := oldestBlock.cumulativeCount - uint64(len(oldestBlock.rel))
 	if start < startOffsetInOldest {
 		return nil, fmt.Errorf("invariant violated: start %d is less than startOffsetInOldest %d", start, startOffsetInOldest)
@@ -286,9 +300,19 @@ func (s *ChunkStore) GetSubRoot(ctx context.Context, key [32]byte) ([32]byte, er
 		k := iter.Key()
 		if bytes.HasPrefix(k, prefix) {
 			val := iter.Value()
-			_, _, r, _, err := deserializeLatestValue(val)
+			_, _, r, relIndices, err := deserializeLatestValue(val)
 			if err != nil {
 				return [32]byte{}, fmt.Errorf("failed to deserialize latest value for key %x: %w", key, err)
+			}
+			blockNum := binary.BigEndian.Uint64(k[33:])
+			for _, rel := range relIndices {
+				abs := blockNum*s.chunkSize + uint64(rel)
+				var idxBytes [8]byte
+				binary.BigEndian.PutUint64(idxBytes[:], abs)
+				leafHash := rfc6962.DefaultHasher.HashLeaf(idxBytes[:])
+				if err := r.Append(leafHash, nil); err != nil {
+					return [32]byte{}, fmt.Errorf("failed to append on-the-fly leaf hash for index %d: %w", abs, err)
+				}
 			}
 			if r.End() == 0 {
 				var root [32]byte
