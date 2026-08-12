@@ -23,6 +23,11 @@ Data is partitioned into chunks per key, where the chunk size (e.g., 65536) dict
         *   There are **no prefix flags** (no distinction between active/sealed chunks on write).
         *   The serialized `compact.Range` in chunk $N$ represents the finalized range state covering all elements in older chunks preceding chunk $N$ (chunks $0$ to $N-1$).
         *   The `relativeIndices` slice contains the logical offsets of elements written to this specific chunk $N$.
+        *   **Delimitless Deserialization**: To avoid storing a separate length prefix for the variable-length range, the deserializer uses the range structure to dynamically compute the boundary:
+            *   The `serialized compact.Range` starts with an 8-byte uint64 representing the size of the sealed tree.
+            *   The number of hashes in the range is determined by the number of set bits in this size (`bits.OnesCount64(size)`).
+            *   The exact byte boundary of the range is calculated dynamically as `8 + bits.OnesCount64(size) * 32` bytes.
+            *   The remaining bytes in the value payload are parsed directly as relative indices.
 
 ### Key Operations
 
