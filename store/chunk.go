@@ -45,10 +45,23 @@ func (s *ChunkStore) Close() error {
 
 // WriteBatch writes a batch of updates atomically.
 func (s *ChunkStore) WriteBatch(ctx context.Context, updates map[[32]byte][]uint64) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	for key, newIndices := range updates {
+	iter, err := s.db.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create iterator: %w", err)
+	}
+	defer iter.Close()
+
+	keys := sortedKeys(updates)
+
+	for _, key := range keys {
+		newIndices := updates[key]
 		if len(newIndices) == 0 {
 			continue
 		}
@@ -66,10 +79,6 @@ func (s *ChunkStore) WriteBatch(ctx context.Context, updates map[[32]byte][]uint
 
 		// Find previous latest chunk
 		upperBound := prefixUpperBound(prefix)
-		iter, err := s.db.NewIter(&pebble.IterOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to create iterator: %w", err)
-		}
 
 		var prevKey []byte
 		var prevVal []byte
@@ -82,9 +91,6 @@ func (s *ChunkStore) WriteBatch(ctx context.Context, updates map[[32]byte][]uint
 				prevVal = make([]byte, len(iter.Value()))
 				copy(prevVal, iter.Value())
 			}
-		}
-		if err := iter.Close(); err != nil {
-			return fmt.Errorf("failed to close iterator: %w", err)
 		}
 
 		var currChunkNum uint64

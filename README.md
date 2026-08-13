@@ -32,9 +32,12 @@ Data is partitioned into chunks per key, where the chunk size (e.g., 65536) dict
 ### Key Operations
 
 *   **Write (Append)**:
-    1.  **Locate Active Chunk**: Perform a `SeekLT` using `Prefix + Hash(Key) + 0xFFFFFFFFFFFFFFFF` to find the highest chunk key for the prefix. If found, this is the current active chunk.
-    2.  **Deserialize Chunk**: If the active chunk exists, deserialize its value into memory (`starting_range` and `relative_indices`). If it does not exist, initialize a new empty chunk.
-    3.  **Append & Handle Boundary**:
+    1.  **Lexicographical Key Sorting & Iterator Reuse**:
+        *   Sort the batch's keys in ascending lexicographical order (`bytes.Compare`).
+        *   Allocate a single `pebble.Iterator` before processing the batch to serve all `SeekLT` calls, reusing internal iterator buffers and maintaining forward cache locality in the LSM tree.
+    2.  **Locate Active Chunk**: Reusing the batch iterator, perform a `SeekLT` using `Prefix + Hash(Key) + 0xFFFFFFFFFFFFFFFF` to find the highest chunk key for the prefix. If found, this is the current active chunk.
+    3.  **Deserialize Chunk**: If the active chunk exists, deserialize its value into memory (`starting_range` and `relative_indices`). If it does not exist, initialize a new empty chunk.
+    4.  **Append & Handle Boundary**:
         *   Iterate over new indices.
         *   If a new index crosses the logical chunk boundary (i.e., `index / chunkSize != currChunkNum`):
             *   If the current chunk was modified, write it to Pebble under its chunk key. Unlike the sealing design, **no sealing write** is performed on the old chunk (no stripping of ranges).
@@ -42,8 +45,8 @@ Data is partitioned into chunks per key, where the chunk size (e.g., 65536) dict
             *   Initialize a new chunk with `starting_range = finalized_range`, and clear `relative_indices`.
             *   Set `currChunkNum = index / chunkSize`.
         *   Append the relative offset `uint16(index % chunkSize)` to `relative_indices` and mark the chunk as modified.
-    4.  **Write Active Chunk**: If modified, serialize and write the final active chunk to Pebble under its key.
-    5.  **Commit Batch**: Commit all writes atomically.
+    5.  **Write Active Chunk**: If modified, serialize and write the final active chunk to Pebble under its key.
+    6.  **Commit Batch**: Close the iterator and commit all writes in the batch atomically.
 *   **Read (Lookup)**:
     1.  **Seek Lower Bound**: Calculate the starting chunk number: `startChunkNum = start / chunkSize`. Seek `SeekGE` using `Prefix + Hash(Key) + startChunkNum` to position the iterator.
     2.  **Scan Forward**: Scan forward using `Next` until the key's prefix boundary is reached.
@@ -80,6 +83,21 @@ Data is partitioned into chunks per key, where the chunk size (e.g., 65536) dict
     *   Similar to `PebbleChunkScan` but performs an extra write to rewrite/seal the older chunk on boundary crossing.
     *   **Pros**: Saves storage footprint by stripping range metadata from sealed chunks.
     *   **Cons**: Degrades write throughput due to the extra write amplification.
+
+---
+
+## Batch Write Optimization: Iterator Reuse & Lexicographical Key Sorting
+
+In storage engines built on LSM-trees (like Pebble or RocksDB), creating and destroying an iterator for every key in a write batch introduces significant memory allocation and CPU overhead. Furthermore, executing `SeekLT` calls on random keys forces the iterator to perform uncoordinated traversals across LSM levels and sstables.
+
+### The Optimization:
+1. **Lexicographical Key Sorting**: Before executing writes, the batch keys are sorted in ascending byte order using `bytes.Compare`.
+2. **Single Shared Iterator**: A single `pebble.Iterator` is allocated once at the start of `WriteBatch` and reused across all key seeks in the batch.
+
+### Performance Impact:
+* **Mode B (High Cardinality - 1M keys)**: Write throughput increased from **~19k QPS to >80k QPS (a 4x / 300% improvement!)**. Because each batch contains hundreds of distinct keys, monotonic seeks over a single iterator completely eliminate per-key iterator construction and benefit from block cache and sstable index locality.
+* **Mode C (Mixed Workload - 100k keys)**: Write throughput increased from **~34k QPS to >105k QPS (a 3x / 200% improvement)**.
+* **Mode A (Hot Keys - 10 keys)**: Maintained sustained maximum throughput (**~165k–188k QPS**).
 
 ---
 

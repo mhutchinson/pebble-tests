@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"slices"
 )
 
 const chunkPrefix = 'c'
@@ -25,4 +27,16 @@ type IndexStore interface {
 
 	// Close flushes all writes and closes the database.
 	Close() error
+}
+
+// sortedKeys returns the map keys sorted in ascending lexicographical order.
+func sortedKeys(updates map[[32]byte][]uint64) [][32]byte {
+	keys := make([][32]byte, 0, len(updates))
+	for k := range updates {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b [32]byte) int {
+		return bytes.Compare(a[:], b[:])
+	})
+	return keys
 }

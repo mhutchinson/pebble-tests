@@ -1067,3 +1067,116 @@ func TestCrossEngineConsistency(t *testing.T) {
 		}
 	}
 }
+
+func TestSortedKeys(t *testing.T) {
+	// Test empty map
+	if keys := sortedKeys(nil); len(keys) != 0 {
+		t.Errorf("Expected 0 keys, got %d", len(keys))
+	}
+	if keys := sortedKeys(map[[32]byte][]uint64{}); len(keys) != 0 {
+		t.Errorf("Expected 0 keys, got %d", len(keys))
+	}
+
+	// Test populated map
+	k1 := [32]byte{0x50}
+	k2 := [32]byte{0x10}
+	k3 := [32]byte{0xff}
+	k4 := [32]byte{0x00}
+	k5 := [32]byte{0x80}
+
+	updates := map[[32]byte][]uint64{
+		k1: {1},
+		k2: {2},
+		k3: {3},
+		k4: {4},
+		k5: {5},
+	}
+
+	keys := sortedKeys(updates)
+	if len(keys) != 5 {
+		t.Fatalf("Expected 5 keys, got %d", len(keys))
+	}
+
+	for i := 1; i < len(keys); i++ {
+		if bytes.Compare(keys[i-1][:], keys[i][:]) >= 0 {
+			t.Errorf("Keys not strictly sorted: keys[%d]=%x >= keys[%d]=%x", i-1, keys[i-1], i, keys[i])
+		}
+	}
+
+	if keys[0] != k4 || keys[1] != k2 || keys[2] != k1 || keys[3] != k5 || keys[4] != k3 {
+		t.Errorf("Unexpected sorted keys order: %v", keys)
+	}
+}
+
+func TestWriteBatch_UnsortedKeysOrder(t *testing.T) {
+	ctx := context.Background()
+
+	dirChunk, _ := os.MkdirTemp("", "pebble-unsorted-chunk-*")
+	defer os.RemoveAll(dirChunk)
+	dirScan, _ := os.MkdirTemp("", "pebble-unsorted-scan-*")
+	defer os.RemoveAll(dirScan)
+	dirSealingChunk, _ := os.MkdirTemp("", "pebble-unsorted-sealing-chunk-*")
+	defer os.RemoveAll(dirSealingChunk)
+	dirSealingScan, _ := os.MkdirTemp("", "pebble-unsorted-sealing-scan-*")
+	defer os.RemoveAll(dirSealingScan)
+	dirLog, _ := os.MkdirTemp("", "pebble-unsorted-log-*")
+	defer os.RemoveAll(dirLog)
+	dirFlat, _ := os.MkdirTemp("", "pebble-unsorted-flat-*")
+	defer os.RemoveAll(dirFlat)
+
+	sChunk, _ := NewChunkStore(dirChunk, 4)
+	defer sChunk.Close()
+	sScan, _ := NewChunkScanStore(dirScan, 4)
+	defer sScan.Close()
+	sSealingChunk, _ := NewSealingChunkStore(dirSealingChunk, 4)
+	defer sSealingChunk.Close()
+	sSealingScan, _ := NewSealingChunkScanStore(dirSealingScan, 4)
+	defer sSealingScan.Close()
+	sLog, _ := NewLogStore(dirLog)
+	defer sLog.Close()
+	sFlat, _ := NewFlatStore(dirFlat)
+	defer sFlat.Close()
+
+	stores := []IndexStore{sFlat, sLog, sSealingChunk, sSealingScan, sChunk, sScan}
+
+	// 1. Test empty batch
+	for _, s := range stores {
+		if err := s.WriteBatch(ctx, map[[32]byte][]uint64{}); err != nil {
+			t.Fatalf("Empty WriteBatch failed: %v", err)
+		}
+	}
+
+	// 2. Test batch with multiple keys
+	kZ := [32]byte{0xfe}
+	kA := [32]byte{0x01}
+	kM := [32]byte{0x80}
+
+	batch := map[[32]byte][]uint64{
+		kZ: {10, 11, 20},
+		kA: {1, 2, 3, 5},
+		kM: {7, 8, 9},
+	}
+
+	for _, s := range stores {
+		if err := s.WriteBatch(ctx, batch); err != nil {
+			t.Fatalf("WriteBatch with unsorted map keys failed: %v", err)
+		}
+	}
+
+	// Verify lookups
+	for _, key := range [][32]byte{kA, kM, kZ} {
+		var results [][]uint64
+		for _, s := range stores {
+			res, err := s.Lookup(ctx, key, 0)
+			if err != nil {
+				t.Fatalf("Lookup failed: %v", err)
+			}
+			results = append(results, res)
+		}
+		for i := 1; i < len(stores); i++ {
+			if !equalSlices(results[i], results[0]) {
+				t.Errorf("Mismatch in lookup results for key %x: store %d got %v, store 0 got %v", key[:2], i, results[i], results[0])
+			}
+		}
+	}
+}
