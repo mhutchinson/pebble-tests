@@ -101,6 +101,29 @@ In storage engines built on LSM-trees (like Pebble or RocksDB), creating and des
 
 ---
 
+## Prefix Bloom Filters Optimization: `PrefixChunkScanStore` (Chunk Size 65536)
+
+By configuring Pebble with a custom `Comparer` defining `Split: func(k []byte) int { if len(k) >= 33 { return 33 }; return len(k) }` and enabling Bloom filters (`bloom.FilterPolicy(10)` across all SSTable levels), Pebble generates Bloom filters on the 33-byte prefix (`'c' + Hash(Key)`).
+
+### Key Architectural Improvements:
+1. **Fast Prefix Probing via `SeekPrefixGE`**: When processing write batches across high-cardinality keys (e.g., Mode B), `iter.SeekPrefixGE(prefix)` uses the prefix bloom filter to immediately skip SSTables that do not contain the key, avoiding unnecessary disk reads and SST block decoding.
+2. **First Chunk Fast-Path**: With chunk size 65536, the first chunk found (`chunk 0`) is almost always the active chunk (unless it already reached 65536 entries), allowing immediate O(1) active chunk determination.
+
+### Comparative Benchmark Results (Chunk Size = 65536, 100,000 Entries):
+
+| Workload Mode | Metric | Standard `chunk_scan` | `prefix_chunk_scan` (Bloom Filter) | Impact |
+| :--- | :--- | :---: | :---: | :--- |
+| **Mode B (1M Keys, High Cardinality)** | Write QPS | 75,569 | **102,240** | **+35.3% Write Speedup** |
+| | Write p50 | 9.03ms | **7.27ms** | **-19.5% Latency** |
+| | Write p99 | 49.20ms | **33.17ms** | **-32.6% Latency** |
+| **Mode C (100k Keys, 4 Concurrent Readers)** | Write QPS | 44,710 | **46,855** | **+4.8% Write Speedup** |
+| | Read QPS | 21,388 | **22,480** | **+5.1% Read Speedup** |
+| **Mode A (10 Keys, Hot Keys)** | Write QPS | 161,579 | **177,143** | **+9.6% Write Speedup** |
+| | Write p50 | 4.14ms | **3.51ms** | **-15.2% Latency** |
+| | Write p99 | 126.57ms | **107.12ms** | **-15.4% Latency** |
+
+---
+
 ## Sealing vs No-Seal Layout Performance Comparison
 
 We executed comparative benchmarks (Mode C, 100,000 keys, 100,000 entries, batch size 1000, 4 concurrent readers) to evaluate the impact of the **No-Seal Layout** optimization:

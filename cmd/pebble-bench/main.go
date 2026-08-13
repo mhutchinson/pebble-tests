@@ -126,6 +126,11 @@ func main() {
 				res := runSealingChunkScan(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
 				results = append(results, res)
 			}
+		case "prefix_chunk_scan":
+			for _, sz := range chunkSizes {
+				res := runPrefixChunkScan(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
+				results = append(results, res)
+			}
 		default:
 			log.Printf("Unknown engine: %s", eng)
 		}
@@ -297,4 +302,23 @@ func formatBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func runPrefixChunkScan(ctx context.Context, baseDir string, chunkSize uint64, mode string, numKeys, numBatches, batchSize int, readCfg harness.ReadConfig) benchmarkResult {
+	name := fmt.Sprintf("prefix_chunk_scan (size=%d)", chunkSize)
+	dir := filepath.Join(baseDir, fmt.Sprintf("prefix_chunk_scan_%d", chunkSize))
+	if err := os.RemoveAll(dir); err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to clean dir %s: %w", dir, err)}
+	}
+	defer os.RemoveAll(dir)
+
+	gen, err := harness.NewGenerator(mode, numKeys)
+	if err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to create generator: %w", err)}
+	}
+
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
+		return store.NewPrefixChunkScanStore(d, chunkSize)
+	})
+	return benchmarkResult{engine: name, results: res, err: err, numReaders: readCfg.NumReaders}
 }
