@@ -989,6 +989,8 @@ func TestCrossEngineConsistency(t *testing.T) {
 	defer os.RemoveAll(dirScan)
 	dirPrefixScan, _ := os.MkdirTemp("", "pebble-consistency-prefix-scan-*")
 	defer os.RemoveAll(dirPrefixScan)
+	dirInvertedScan, _ := os.MkdirTemp("", "pebble-consistency-inverted-scan-*")
+	defer os.RemoveAll(dirInvertedScan)
 
 	sFlat, _ := NewFlatStore(dirFlat)
 	defer sFlat.Close()
@@ -1004,9 +1006,11 @@ func TestCrossEngineConsistency(t *testing.T) {
 	defer sScan.Close()
 	sPrefixScan, _ := NewPrefixChunkScanStore(dirPrefixScan, 4)
 	defer sPrefixScan.Close()
+	sInvertedScan, _ := NewInvertedPrefixChunkScanStore(dirInvertedScan, 4)
+	defer sInvertedScan.Close()
 
-	stores := []IndexStore{sFlat, sLog, sSealingChunk, sSealingScan, sChunk, sScan, sPrefixScan}
-	names := []string{"FlatStore", "LogStore", "SealingChunkStore", "SealingChunkScanStore", "ChunkStore", "ChunkScanStore", "PrefixChunkScanStore"}
+	stores := []IndexStore{sFlat, sLog, sSealingChunk, sSealingScan, sChunk, sScan, sPrefixScan, sInvertedScan}
+	names := []string{"FlatStore", "LogStore", "SealingChunkStore", "SealingChunkScanStore", "ChunkStore", "ChunkScanStore", "PrefixChunkScanStore", "InvertedPrefixChunkScanStore"}
 
 	// Sequence of writes
 	batches := []map[[32]byte][]uint64{
@@ -1129,6 +1133,8 @@ func TestWriteBatch_UnsortedKeysOrder(t *testing.T) {
 	defer os.RemoveAll(dirFlat)
 	dirPrefixScan, _ := os.MkdirTemp("", "pebble-unsorted-prefix-scan-*")
 	defer os.RemoveAll(dirPrefixScan)
+	dirInvertedScan, _ := os.MkdirTemp("", "pebble-unsorted-inverted-scan-*")
+	defer os.RemoveAll(dirInvertedScan)
 
 	sChunk, _ := NewChunkStore(dirChunk, 4)
 	defer sChunk.Close()
@@ -1144,8 +1150,10 @@ func TestWriteBatch_UnsortedKeysOrder(t *testing.T) {
 	defer sFlat.Close()
 	sPrefixScan, _ := NewPrefixChunkScanStore(dirPrefixScan, 4)
 	defer sPrefixScan.Close()
+	sInvertedScan, _ := NewInvertedPrefixChunkScanStore(dirInvertedScan, 4)
+	defer sInvertedScan.Close()
 
-	stores := []IndexStore{sFlat, sLog, sSealingChunk, sSealingScan, sChunk, sScan, sPrefixScan}
+	stores := []IndexStore{sFlat, sLog, sSealingChunk, sSealingScan, sChunk, sScan, sPrefixScan, sInvertedScan}
 
 	// 1. Test empty batch
 	for _, s := range stores {
@@ -1273,6 +1281,103 @@ func TestPrefixChunkScanStoreRawInspection(t *testing.T) {
 	keyChunk10 := make([]byte, 41)
 	copy(keyChunk10, prefix)
 	binary.BigEndian.PutUint64(keyChunk10[33:], 10)
+
+	val10 := getRaw(keyChunk10)
+	range10, rel10, err := deserializeChunkValue(val10)
+	if err != nil {
+		t.Fatalf("Failed to deserialize chunk 10 value: %v", err)
+	}
+	if range10.End() != 2 {
+		t.Errorf("Expected chunk 10 range end to be 2 (covering chunk 5), got %d", range10.End())
+	}
+	if !equalUint16Slices(rel10, []uint16{0}) {
+		t.Errorf("Expected rel indices [0], got %v", rel10)
+	}
+}
+
+func TestInvertedPrefixChunkScanStoreCorrectness_Size65536(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-inverted-prefix-test-65536-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewInvertedPrefixChunkScanStore(tmpDir, 65536)
+	if err != nil {
+		t.Fatalf("Failed to create InvertedPrefixChunkScanStore: %v", err)
+	}
+	defer s.Close()
+
+	runIndexStoreTests(t, s)
+}
+
+func TestInvertedPrefixChunkScanStoreRawInspection(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pebble-inverted-prefix-inspect-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s, err := NewInvertedPrefixChunkScanStore(tmpDir, 2)
+	if err != nil {
+		t.Fatalf("Failed to create InvertedPrefixChunkScanStore: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	key := sha256.Sum256([]byte("inspect-key-inverted"))
+
+	// Write first batch: index 10, 11 (both chunk 5)
+	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {10, 11}}); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	prefix := make([]byte, 33)
+	prefix[0] = chunkPrefix
+	copy(prefix[1:], key[:])
+
+	keyChunk5 := make([]byte, 41)
+	copy(keyChunk5, prefix)
+	binary.BigEndian.PutUint64(keyChunk5[33:], invertChunkNum(5))
+
+	getRaw := func(k []byte) []byte {
+		val, closer, err := s.db.Get(k)
+		if err != nil {
+			t.Fatalf("Failed to get raw key %x: %v", k, err)
+		}
+		defer closer.Close()
+		ret := make([]byte, len(val))
+		copy(ret, val)
+		return ret
+	}
+
+	val5 := getRaw(keyChunk5)
+	range5, rel5, err := deserializeChunkValue(val5)
+	if err != nil {
+		t.Fatalf("Failed to deserialize chunk 5 value: %v", err)
+	}
+	if range5.End() != 0 {
+		t.Errorf("Expected chunk 5 range end to be 0, got %d", range5.End())
+	}
+	if !equalUint16Slices(rel5, []uint16{0, 1}) {
+		t.Errorf("Expected rel indices [0, 1], got %v", rel5)
+	}
+
+	// Write second batch: index 20 (chunk 10)
+	if err := s.WriteBatch(ctx, map[[32]byte][]uint64{key: {20}}); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	// In No-Seal, chunk 5 is NOT modified/rewritten when crossing boundary.
+	val5After := getRaw(keyChunk5)
+	if !bytes.Equal(val5, val5After) {
+		t.Errorf("Expected chunk 5 value to remain unchanged, got diff")
+	}
+
+	// Verify chunk 10
+	keyChunk10 := make([]byte, 41)
+	copy(keyChunk10, prefix)
+	binary.BigEndian.PutUint64(keyChunk10[33:], invertChunkNum(10))
 
 	val10 := getRaw(keyChunk10)
 	range10, rel10, err := deserializeChunkValue(val10)

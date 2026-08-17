@@ -131,6 +131,11 @@ func main() {
 				res := runPrefixChunkScan(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
 				results = append(results, res)
 			}
+		case "inverted_prefix_chunk_scan":
+			for _, sz := range chunkSizes {
+				res := runInvertedPrefixChunkScan(ctx, *dbDir, sz, *mode, numKeys, numBatches, *batchSize, readCfg)
+				results = append(results, res)
+			}
 		default:
 			log.Printf("Unknown engine: %s", eng)
 		}
@@ -319,6 +324,25 @@ func runPrefixChunkScan(ctx context.Context, baseDir string, chunkSize uint64, m
 
 	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
 		return store.NewPrefixChunkScanStore(d, chunkSize)
+	})
+	return benchmarkResult{engine: name, results: res, err: err, numReaders: readCfg.NumReaders}
+}
+
+func runInvertedPrefixChunkScan(ctx context.Context, baseDir string, chunkSize uint64, mode string, numKeys, numBatches, batchSize int, readCfg harness.ReadConfig) benchmarkResult {
+	name := fmt.Sprintf("inverted_prefix_chunk_scan (size=%d)", chunkSize)
+	dir := filepath.Join(baseDir, fmt.Sprintf("inverted_prefix_chunk_scan_%d", chunkSize))
+	if err := os.RemoveAll(dir); err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to clean dir %s: %w", dir, err)}
+	}
+	defer os.RemoveAll(dir)
+
+	gen, err := harness.NewGenerator(mode, numKeys)
+	if err != nil {
+		return benchmarkResult{engine: name, err: fmt.Errorf("failed to create generator: %w", err)}
+	}
+
+	res, err := harness.RunBenchmark(ctx, dir, gen, numBatches, batchSize, numKeys, readCfg, func(d string) (store.IndexStore, error) {
+		return store.NewInvertedPrefixChunkScanStore(d, chunkSize)
 	})
 	return benchmarkResult{engine: name, results: res, err: err, numReaders: readCfg.NumReaders}
 }
