@@ -2,7 +2,9 @@
 
 Based on extensive benchmarking across multiple workloads (up to 20 million entries), we recommend **`PebbleInvertedPrefixChunkScan` (Inverted Chunk Numbers with Prefix Bloom Filters and Chunk Size 65536)** as the default, production-grade storage layout for the VIndex.
 
-It achieves the highest write throughput, lowest latency, zero-I/O key existence checking via Bloom filters, and true $O(1)$ active chunk location across both hot-key and high-cardinality workloads.
+It achieves the highest write throughput, lowest latency, zero-I/O key existence checking via Bloom filters, and true O(1) active chunk location across both hot-key and high-cardinality workloads.
+
+For detailed architectural specifications, failure modes, and schema design, see [DESIGN.md](DESIGN.md).
 
 > **Note**: For historical benchmark comparisons across all prototype engines (`FlatStore`, `LogStore`, `Sealing` layouts, and smaller chunk sizes like 256/1024), see commit `b610d9bd2be55b3b7e4ad52a973d8343c71df9bf`.
 
@@ -25,14 +27,14 @@ It achieves the highest write throughput, lowest latency, zero-I/O key existence
 Data is partitioned into chunks per key with logical chunk size 65536 (`chunkNum = index / chunkSize`).
 
 *   **Keys**: `[Prefix 'c' (1B)] + [Hash(Key) (32B)] + [^chunkNum (8B, BigEndian)]`
-    *   **Inverted Chunk Number (`^chunkNum`)**: Using `math.MaxUint64 - chunkNum` ensures that the latest active chunk ($N$) has the **smallest key** among all chunks for that key prefix.
+    *   **Inverted Chunk Number (`^chunkNum`)**: Using `math.MaxUint64 - chunkNum` ensures that the latest active chunk (chunk N) has the **smallest key** among all chunks for that key prefix.
     *   **Custom Prefix Split**: A custom Pebble `Comparer` splits keys at byte 33 (`'c' + Hash(Key)`).
     *   **Prefix Bloom Filters**: Bloom filters (`bloom.FilterPolicy(10)`) are generated on the 33-byte prefix across all SSTable levels.
 *   **Values**:
     *   **Uniform Value Schema**: `[serialized compact.Range] + [relativeIndices ([]uint16)]`
         *   There are **no prefix flags** (no distinction between active/sealed chunks on write).
-        *   The serialized `compact.Range` in chunk $N$ represents the finalized range state covering all elements in older chunks preceding chunk $N$ (chunks $0$ to $N-1$).
-        *   The `relativeIndices` slice contains the logical offsets of elements written to this specific chunk $N$.
+        *   The serialized `compact.Range` in chunk N represents the finalized range state covering all elements in older chunks preceding chunk N (chunks 0 to N-1).
+        *   The `relativeIndices` slice contains the logical offsets of elements written to this specific chunk N.
         *   **Delimitless Deserialization**: The range boundary is computed dynamically in memory as `8 + bits.OnesCount64(size) * 32` bytes without requiring a length prefix.
 
 ### Key Operations
@@ -41,10 +43,10 @@ Data is partitioned into chunks per key with logical chunk size 65536 (`chunkNum
     1.  **Lexicographical Key Sorting & Shared Iterator**:
         *   Sort the batch's keys in ascending byte order (`bytes.Compare`).
         *   Allocate a single `pebble.Iterator` before the loop and reuse it for all seeks in the batch.
-    2.  **Instant $O(1)$ Active Chunk Seek**:
+    2.  **Instant O(1) Active Chunk Seek**:
         *   Call `iter.SeekPrefixGE(prefix)`.
         *   If the key does not exist, the Bloom filter skips all SSTables immediately (0 disk I/O).
-        *   If the key exists, `SeekPrefixGE(prefix)` lands **directly on the latest active chunk** in $O(1)$ because the latest chunk has the smallest inverted key.
+        *   If the key exists, `SeekPrefixGE(prefix)` lands **directly on the latest active chunk** in O(1) because the latest chunk has the smallest inverted key.
     3.  **Deserialize & Append**:
         *   Deserialize `starting_range` and `relative_indices`.
         *   If a new index crosses the chunk boundary (`index / chunkSize != currChunkNum`):
@@ -60,7 +62,7 @@ Data is partitioned into chunks per key with logical chunk size 65536 (`chunkNum
     3.  **Reconstruct Indices**: Reconstruct absolute indices and slice starting from the requested `start` offset using the first chunk's `compact.Range.End()`.
 
 *   **GetSubRoot**:
-    1.  Call `iter.SeekPrefixGE(prefix)` to land directly on the latest chunk in $O(1)$.
+    1.  Call `iter.SeekPrefixGE(prefix)` to land directly on the latest chunk in O(1).
     2.  Append active relative indices to the compact range on-the-fly and return the computed Merkle root.
 
 ---
@@ -129,6 +131,6 @@ All benchmarks below were executed with a batch size of 1,000 entries across thr
 
 2. **The Triumph of `inverted_prefix_chunk_scan` (Inverted Chunk Numbers)**:
    - Inverting chunk numbers (`^chunkNum`) places the newest chunk at the very beginning of the prefix range.
-   - Calling `SeekPrefixGE(prefix)` lands **directly on the active chunk in $O(1)$** with a single seek, completely eliminating forward scanning.
+   - Calling `SeekPrefixGE(prefix)` lands **directly on the active chunk in O(1)** with a single seek, completely eliminating forward scanning.
    - Combines the **Bloom filter acceleration** of prefix splits with the **instant active chunk seek** of reverse index order.
    - Achieves up to **+60.5% write throughput improvement** on 1M workloads and **206k QPS** on large-scale hot key workloads.
